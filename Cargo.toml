@@ -1,0 +1,35 @@
+[package]
+name = "sonowing"
+version = "1.1.0"
+edition = "2021"
+authors = ["Bryan P. White <CRV Science>"]
+description = "Native safe-Rust bat echolocation and avian vocalization sonic/ultrasonic waveform, STFT spectrogram, MFCC/UMAP clustering, harmonic stack, live mic, and soundscape analyzer"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "sonowing"
+path = "src/lib.rs"
+
+[[bin]]
+name = "sonowing"
+path = "src/main.rs"
+
+[features]
+default = ["hardware-mic"]
+hardware-mic = ["dep:cpal"]
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+cpal = { version = "0.15", optional = true }
+eframe = "0.31"
+egui = "0.31"
+rayon = "1.10"
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
