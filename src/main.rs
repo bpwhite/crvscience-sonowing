@@ -10,7 +10,7 @@ use rayon::prelude::*;
 use sonowing::call_extractor::{extract_calls, DetectionMode, DetectorConfig, TaxonDomain};
 use sonowing::dsp::{compute_stft, StftConfig};
 use sonowing::exporters::{write_calls_csv, write_raven_selection_table};
-use sonowing::gui::{load_any_bioacoustic_path, SonoWingApp};
+use sonowing::gui::{load_any_bioacoustic_path, render_headless_screenshot, SonoWingApp};
 use sonowing::harmonic_tracker::analyze_harmonic_stacks;
 use sonowing::live_mic::LiveMicEngine;
 use sonowing::mfcc_cluster::{analyze_repertoire_clusters, ManifoldClusterConfig};
@@ -42,6 +42,14 @@ struct Cli {
     /// Path to the SQLite WAL session repository.
     #[arg(long, default_value = "sonowing_sessions.sqlite3")]
     db: PathBuf,
+
+    /// Render a 1600x1000 offscreen GPU screenshot to PNG and exit without opening a window.
+    #[arg(long, value_name = "OUT_PATH")]
+    headless_screenshot: Option<PathBuf>,
+
+    /// Select screenshot view (1 = Ultrasonic Spectrogram & Waveform, 2 = Harmonic Tracker & Call Extractor, 3 = MFCC/UMAP Clusters & Soundscape).
+    #[arg(long, default_value_t = 1)]
+    screenshot_view: u8,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -134,6 +142,16 @@ enum CliAuditionMode {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+
+    if let Some(out_path) = &cli.headless_screenshot {
+        render_headless_screenshot(out_path, cli.screenshot_view)?;
+        println!(
+            "Saved {} (1600x1000 RGBA offscreen screenshot, view {})",
+            out_path.display(),
+            cli.screenshot_view
+        );
+        return Ok(());
+    }
 
     match cli.command {
         None => launch_gui(cli.open, cli.skip_hub, cli.db),

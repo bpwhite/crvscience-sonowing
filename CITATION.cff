@@ -1,9 +1,10 @@
 cff-version: 1.2.0
-message: "If you use this software, please cite both the software repository and the CRV Science Apps hub."
+message: "If you use this software or its validation datasets, please cite both the software repository and the accompanying CRV Science Apps monograph."
 type: software
 title: "SonoWing: Ultrasonic Bat Echolocation and Avian Bioacoustic Spectrogram, MFCC/UMAP, and Harmonic Analyzer"
 version: "1.1.0"
 date-released: "2026-11-15"
+doi: "10.5281/zenodo.24244091"
 url: "https://crvscience.com/apps"
 repository-code: "https://github.com/bpwhite/crvscience-sonowing"
 license: "MIT OR Apache-2.0"
@@ -17,3 +18,15 @@ keywords:
   - "spectrograms"
   - "soundscape ecology"
   - "Rust"
+preferred-citation:
+  type: article
+  title: "SonoWing: Analyzing Bat Echolocation and Bird Calls with Spectrograms and Harmonic Tracking"
+  authors:
+    - family-names: "White"
+      given-names: "Bryan P."
+      affiliation: "CRV Science Labs"
+  year: 2026
+  journal: "CRV Science Apps Preprints"
+  doi: "10.5281/zenodo.24244091"
+  url: "https://crvscience.com/apps/preprints/sonowing-bioacoustic-echolocation-analyzer"
+  notes: "Preprint ID: APP-PREPRINT-17"

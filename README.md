@@ -1,5 +1,7 @@
 # SonoWing (`sonowing` v1.1.0)
 
+![SonoWing — Ultrasonic Bat Echolocation & Avian Bioacoustic Spectrogram, Harmonic Tracker & MFCC/UMAP Workstation](validation/headless_screenshot.png)
+
 Native safe-Rust (`#![forbid(unsafe_code)]`) desktop GUI workstation (`eframe` / `egui` `0.31`) and headless parallel CLI (`clap` `4.5` + `rayon` `1.10`) for **Chiropteran (bat) ultrasonic echolocation** and **Avian (bird) nocturnal flight call (`NFC`) & song** waveform, spectrogram, unsupervised `MFCC`/`UMAP` clustering, harmonic stack tracking, live microphone capture, and soundscape analysis.
 
 ## What's New in `v1.1.0`

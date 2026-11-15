@@ -200,7 +200,16 @@ impl SonoWingApp {
         skip_hub: bool,
         db_path: PathBuf,
     ) -> Self {
-        configure_dark_scientific_theme(&cc.egui_ctx);
+        Self::new_headless(&cc.egui_ctx, initial_file, skip_hub, db_path)
+    }
+
+    pub fn new_headless(
+        ctx: &egui::Context,
+        initial_file: Option<PathBuf>,
+        skip_hub: bool,
+        db_path: PathBuf,
+    ) -> Self {
+        configure_dark_scientific_theme(ctx);
 
         let init_rec = if let Some(ref p) = initial_file {
             load_any_bioacoustic_path(p)
@@ -556,8 +565,8 @@ impl SonoWingApp {
     }
 }
 
-impl eframe::App for SonoWingApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+impl SonoWingApp {
+    pub fn ui_step(&mut self, ctx: &egui::Context) {
         self.poll_live_microphone(ctx);
 
         let dropped: Vec<PathBuf> = ctx.input(|i| {
@@ -603,6 +612,240 @@ impl eframe::App for SonoWingApp {
             self.render_sessions_modal(ctx);
         }
     }
+}
+
+impl eframe::App for SonoWingApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.ui_step(ctx);
+    }
+}
+
+fn block_on_future<F: std::future::Future>(fut: F) -> F::Output {
+    use std::sync::Arc;
+    struct ThreadUnparker(std::thread::Thread);
+    impl std::task::Wake for ThreadUnparker {
+        fn wake(self: Arc<Self>) {
+            self.0.unpark();
+        }
+    }
+    let waker = std::task::Waker::from(Arc::new(ThreadUnparker(std::thread::current())));
+    let mut cx = std::task::Context::from_waker(&waker);
+    let mut fut = std::pin::pin!(fut);
+    loop {
+        match fut.as_mut().poll(&mut cx) {
+            std::task::Poll::Ready(val) => return val,
+            std::task::Poll::Pending => std::thread::park(),
+        }
+    }
+}
+
+/// Render an offscreen 1600x1000 RGBA PNG screenshot without opening any OS GUI window.
+pub fn render_headless_screenshot(out_path: &Path, view: u8) -> Result<(), String> {
+    use eframe::egui_wgpu::{wgpu, Renderer, ScreenDescriptor};
+
+    const WIDTH: u32 = 1600;
+    const HEIGHT: u32 = 1000;
+    const BYTES_PER_ROW: u32 = WIDTH * 4;
+
+    let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor::default());
+    let adapter = block_on_future(instance.request_adapter(&wgpu::RequestAdapterOptions {
+        power_preference: wgpu::PowerPreference::HighPerformance,
+        compatible_surface: None,
+        force_fallback_adapter: false,
+    }))
+    .or_else(|| {
+        block_on_future(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::LowPower,
+            compatible_surface: None,
+            force_fallback_adapter: true,
+        }))
+    })
+    .ok_or_else(|| "No GPU adapter available for offscreen rendering".to_string())?;
+
+    let (device, queue) =
+        block_on_future(adapter.request_device(&wgpu::DeviceDescriptor::default(), None))
+            .map_err(|e| format!("Failed to request offscreen GPU device: {e}"))?;
+
+    let format = wgpu::TextureFormat::Rgba8Unorm;
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("sonowing-offscreen-target"),
+        size: wgpu::Extent3d {
+            width: WIDTH,
+            height: HEIGHT,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    });
+    let texture_view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let staging = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("sonowing-offscreen-staging"),
+        size: (BYTES_PER_ROW * HEIGHT) as u64,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+
+    let mut renderer = Renderer::new(&device, format, None, 1, false);
+    let egui_ctx = egui::Context::default();
+    egui_ctx.set_pixels_per_point(1.0);
+
+    let temp_db = std::env::temp_dir().join(format!("sonowing_headless_{}.sqlite3", std::process::id()));
+    let _ = std::fs::remove_file(&temp_db);
+
+    let sample_wav = PathBuf::from("samples/MYLU_Willamette_Demo_250kHz.wav");
+    let initial_file = if sample_wav.exists() {
+        Some(sample_wav)
+    } else {
+        None
+    };
+
+    let mut app = SonoWingApp::new_headless(&egui_ctx, initial_file, true, temp_db.clone());
+    app.stage = AppStage::Workstation;
+
+    let tab_id = egui::Id::new("sonowing_bottom_tab_v11");
+    match view {
+        2 => {
+            app.active_preset = BuiltinPreset::A4VathHarmonicStack;
+            app.raw_recording = synthesize_preset(BuiltinPreset::A4VathHarmonicStack);
+            app.recompute_full_pipeline(true);
+            app.show_harmonics_overlay = true;
+            app.show_call_boxes = true;
+            app.selected_call_idx = if app.detected_calls.is_empty() { None } else { Some(0) };
+            egui_ctx.data_mut(|d| d.insert_temp(tab_id, BottomDockTab::CallsTable));
+        }
+        3 => {
+            app.selected_call_idx = if app.detected_calls.is_empty() { None } else { Some(0) };
+            egui_ctx.data_mut(|d| d.insert_temp(tab_id, BottomDockTab::MfccUmapClusters));
+        }
+        _ => {
+            app.selected_call_idx = if app.detected_calls.is_empty() { None } else { Some(0) };
+            egui_ctx.data_mut(|d| d.insert_temp(tab_id, BottomDockTab::CallsTable));
+        }
+    }
+
+    for frame_idx in 0..4_u32 {
+        let raw_input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(WIDTH as f32, HEIGHT as f32),
+            )),
+            viewports: std::iter::once((
+                egui::ViewportId::ROOT,
+                egui::ViewportInfo {
+                    native_pixels_per_point: Some(1.0),
+                    ..Default::default()
+                },
+            ))
+            .collect(),
+            time: Some(frame_idx as f64 / 60.0),
+            predicted_dt: 1.0 / 60.0,
+            ..Default::default()
+        };
+        let full_output = egui_ctx.run(raw_input, |ctx| {
+            app.ui_step(ctx);
+        });
+        for (id, image_delta) in &full_output.textures_delta.set {
+            renderer.update_texture(&device, &queue, *id, image_delta);
+        }
+        let paint_jobs = egui_ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
+        let screen_descriptor = ScreenDescriptor {
+            size_in_pixels: [WIDTH, HEIGHT],
+            pixels_per_point: 1.0,
+        };
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("sonowing-offscreen-encoder"),
+        });
+        let user_cmd_bufs = renderer.update_buffers(
+            &device,
+            &queue,
+            &mut encoder,
+            &paint_jobs,
+            &screen_descriptor,
+        );
+        {
+            let render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("sonowing-offscreen-pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &texture_view,
+                    resolve_target: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color::BLACK),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                occlusion_query_set: None,
+                timestamp_writes: None,
+            });
+            let mut render_pass = render_pass.forget_lifetime();
+            renderer.render(&mut render_pass, &paint_jobs, &screen_descriptor);
+        }
+        if frame_idx == 3 {
+            encoder.copy_texture_to_buffer(
+                wgpu::TexelCopyTextureInfo {
+                    texture: &texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::TexelCopyBufferInfo {
+                    buffer: &staging,
+                    layout: wgpu::TexelCopyBufferLayout {
+                        offset: 0,
+                        bytes_per_row: Some(BYTES_PER_ROW),
+                        rows_per_image: Some(HEIGHT),
+                    },
+                },
+                wgpu::Extent3d {
+                    width: WIDTH,
+                    height: HEIGHT,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+        queue.submit(user_cmd_bufs.into_iter().chain(std::iter::once(encoder.finish())));
+        device.poll(wgpu::Maintain::Wait);
+        for id in &full_output.textures_delta.free {
+            renderer.free_texture(id);
+        }
+    }
+
+    let slice = staging.slice(..);
+    let (tx, rx) = std::sync::mpsc::channel();
+    slice.map_async(wgpu::MapMode::Read, move |res| {
+        let _ = tx.send(res);
+    });
+    device.poll(wgpu::Maintain::Wait);
+    rx.recv()
+        .map_err(|e| format!("GPU readback channel error: {e}"))?
+        .map_err(|e| format!("GPU buffer map failed: {e}"))?;
+    let mapped = slice.get_mapped_range();
+
+    if let Some(parent) = out_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create output directory: {e}"))?;
+        }
+    }
+    let file = std::fs::File::create(out_path)
+        .map_err(|e| format!("Failed to create PNG file {}: {e}", out_path.display()))?;
+    let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), WIDTH, HEIGHT);
+    encoder.set_color(png::ColorType::Rgba);
+    encoder.set_depth(png::BitDepth::Eight);
+    let mut writer = encoder
+        .write_header()
+        .map_err(|e| format!("PNG header error: {e}"))?;
+    writer
+        .write_image_data(&mapped)
+        .map_err(|e| format!("PNG write error: {e}"))?;
+    drop(mapped);
+    staging.unmap();
+    let _ = std::fs::remove_file(&temp_db);
+    Ok(())
 }
 
 impl SonoWingApp {
