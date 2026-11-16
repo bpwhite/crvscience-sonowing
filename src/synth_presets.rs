@@ -22,6 +22,70 @@ use std::collections::BTreeMap;
 use std::f64::consts::{PI, TAU};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PresetCategory {
+    BatEcholocation,
+    AvianVocalizations,
+    WidebandTransect,
+}
+
+impl PresetCategory {
+    pub const ALL: [Self; 3] = [
+        Self::BatEcholocation,
+        Self::AvianVocalizations,
+        Self::WidebandTransect,
+    ];
+
+    pub fn heading(self) -> &'static str {
+        match self {
+            Self::BatEcholocation => "Bat Echolocation • 250–384 kHz",
+            Self::AvianVocalizations => "Avian Song & Flight Calls • 48 kHz",
+            Self::WidebandTransect => "Wideband Dual Transect • 192 kHz",
+        }
+    }
+
+    pub fn tag(self) -> &'static str {
+        match self {
+            Self::BatEcholocation => "CHIROPTERA",
+            Self::AvianVocalizations => "AVES",
+            Self::WidebandTransect => "WIDEBAND",
+        }
+    }
+
+    pub fn tag_rgb(self) -> [u8; 3] {
+        match self {
+            Self::BatEcholocation => [32, 138, 178],
+            Self::AvianVocalizations => [42, 152, 112],
+            Self::WidebandTransect => [128, 92, 196],
+        }
+    }
+
+    pub fn description(self) -> &'static str {
+        match self {
+            Self::BatEcholocation => {
+                "Full-spectrum ultrasonic FM/QCF/CF echolocation passes with feeding buzzes and harmonic stacks."
+            }
+            Self::AvianVocalizations => {
+                "Nocturnal flight calls, dawn-chorus whistles, and multi-harmonic strigid/passerine benchmarks."
+            }
+            Self::WidebandTransect => {
+                "Simultaneous audible-to-ultrasonic field capture separating low-kHz avian NFCs and 20 kHz bats."
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PresetCardMeta {
+    pub category: PresetCategory,
+    pub taxon_rate_pill: &'static str,
+    pub band_code: &'static str,
+    pub common_name: &'static str,
+    pub scientific_name: &'static str,
+    pub signature: &'static str,
+    pub pill_rgb: [u8; 3],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BuiltinPreset {
     B1MyluFeedingBuzz,
     B2EpfuLanoSympatric,
@@ -127,6 +191,96 @@ impl BuiltinPreset {
             Self::M1RiparianBatAndBirdDual => {
                 "Simultaneous wide-band 192 kHz capture clustering Lasiurus cinereus QCF pulses and avian NFCs"
             }
+        }
+    }
+
+    pub fn category(self) -> PresetCategory {
+        self.hub_meta().category
+    }
+
+    pub fn hub_meta(self) -> PresetCardMeta {
+        match self {
+            Self::B1MyluFeedingBuzz => PresetCardMeta {
+                category: PresetCategory::BatEcholocation,
+                taxon_rate_pill: "BAT • 250 kHz",
+                band_code: "MYLU",
+                common_name: "Little Brown Bat — Feeding Buzz",
+                scientific_name: "Myotis lucifugus",
+                signature: "41 kHz Fc hockey-stick FM pulses accelerating from 82 ms search IPI into an 8.5 ms terminal insect capture buzz.",
+                pill_rgb: [32, 138, 178],
+            },
+            Self::B2EpfuLanoSympatric => PresetCardMeta {
+                category: PresetCategory::BatEcholocation,
+                taxon_rate_pill: "BAT • 250 kHz",
+                band_code: "EPFU / LANO",
+                common_name: "Big Brown & Silver-haired Bats",
+                scientific_name: "Eptesicus fuscus & Lasionycteris noctivagans",
+                signature: "Sympatric ~28 kHz QCF pass separated into distinct MFCC/UMAP clusters via Fmax (>55 kHz) and body slope.",
+                pill_rgb: [32, 138, 178],
+            },
+            Self::B3CotoWhisperHarmonic => PresetCardMeta {
+                category: PresetCategory::BatEcholocation,
+                taxon_rate_pill: "BAT • 250 kHz",
+                band_code: "COTO",
+                common_name: "Townsend's Big-eared Bat",
+                scientific_name: "Corynorhinus townsendii",
+                signature: "Low-amplitude Oregon whisper bat exhibiting f0 = 26 kHz, dominant 2f0 = 52 kHz, and 3f0 = 78 kHz harmonic stack.",
+                pill_rgb: [32, 138, 178],
+            },
+            Self::B4RhfeHorseshoeCf => PresetCardMeta {
+                category: PresetCategory::BatEcholocation,
+                taxon_rate_pill: "BAT • 384 kHz",
+                band_code: "RHFE",
+                common_name: "Greater Horseshoe Bat — CF Staple",
+                scientific_name: "Rhinolophus ferrumequinum",
+                signature: "High-duty-cycle Palearctic horseshoe bat emitting 30 ms constant-frequency FM-CF-FM calls at 83.6 kHz.",
+                pill_rgb: [52, 120, 195],
+            },
+            Self::A1SwthYrwaNightFlight => PresetCardMeta {
+                category: PresetCategory::AvianVocalizations,
+                taxon_rate_pill: "AVIAN • 48 kHz",
+                band_code: "SWTH / YRWA",
+                common_name: "Swainson's Thrush & Myrtle Warbler",
+                scientific_name: "Catharus ustulatus & Setophaga coronata",
+                signature: "Separates upward-sweeping 2.7->4.1 kHz thrush peeps from 6.7 kHz warbler flight zeets in UMAP space.",
+                pill_rgb: [42, 152, 112],
+            },
+            Self::A2BcchWcspDawnChorus => PresetCardMeta {
+                category: PresetCategory::AvianVocalizations,
+                taxon_rate_pill: "AVIAN • 48 kHz",
+                band_code: "BCCH / WCSP",
+                common_name: "Chickadee & White-crowned Sparrow",
+                scientific_name: "Poecile atricapillus & Zonotrichia leucophrys",
+                signature: "Low-entropy two-note 'fee-bee' pure whistles paired against frequency-modulated sparrow dawn song syllables.",
+                pill_rgb: [42, 152, 112],
+            },
+            Self::A3NswoFinleyTootTrain => PresetCardMeta {
+                category: PresetCategory::AvianVocalizations,
+                taxon_rate_pill: "AVIAN • 48 kHz",
+                band_code: "NSWO",
+                common_name: "Northern Saw-whet Owl — Toot Train",
+                scientific_name: "Aegolius acadicus",
+                signature: "Rhythmic 1.15 kHz nocturnal advertising whistles carrying clear 2.30 kHz and 3.45 kHz harmonic overtones.",
+                pill_rgb: [42, 152, 112],
+            },
+            Self::A4VathHarmonicStack => PresetCardMeta {
+                category: PresetCategory::AvianVocalizations,
+                taxon_rate_pill: "AVIAN • 48 kHz",
+                band_code: "VATH / WSOW",
+                common_name: "Varied Thrush & Western Screech-Owl",
+                scientific_name: "Ixoreus naevius & Megascops kennicottii",
+                signature: "Sustained 3 kHz harmonic whistle stack paired with a 5-harmonic (f0..5f0) screech-owl trill ladder.",
+                pill_rgb: [42, 152, 112],
+            },
+            Self::M1RiparianBatAndBirdDual => PresetCardMeta {
+                category: PresetCategory::WidebandTransect,
+                taxon_rate_pill: "DUAL • 192 kHz",
+                band_code: "LACI + SWTH",
+                common_name: "Hoary Bat + Swainson's Thrush Transect",
+                scientific_name: "Lasiurus cinereus & Catharus ustulatus",
+                signature: "Wideband dual-taxon riparian recording clustering 20 kHz bat QCF pulses alongside nocturnal bird flight calls.",
+                pill_rgb: [128, 92, 196],
+            },
         }
     }
 }

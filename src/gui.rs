@@ -36,7 +36,7 @@ use crate::mfcc_cluster::{
 };
 use crate::soundscape_indices::{compute_soundscape_indices, SoundscapeIndices};
 use crate::storage::{SavedSessionSummary, SonoWingRepository};
-use crate::synth_presets::{synthesize_preset, BuiltinPreset};
+use crate::synth_presets::{synthesize_preset, BuiltinPreset, PresetCategory};
 use crate::taxa_library::reference_species_catalog;
 use crate::ultrasonic_audio::{render_audible_recording, AuditionMode};
 use crate::wav_guano::{
@@ -606,11 +606,10 @@ impl SonoWingApp {
             self.show_sessions_modal = true;
         }
 
-        self.render_top_menu_bar(ctx);
-
         if self.stage == AppStage::StartupHub {
             self.render_startup_hub(ctx);
         } else {
+            self.render_top_menu_bar(ctx);
             if self.spec_dirty || self.spec_texture.is_none() {
                 self.rebuild_spectrogram_texture(ctx);
             }
@@ -735,6 +734,9 @@ pub fn render_headless_screenshot(out_path: &Path, view: u8) -> Result<(), Strin
         3 => {
             app.selected_call_idx = if app.detected_calls.is_empty() { None } else { Some(0) };
             egui_ctx.data_mut(|d| d.insert_temp(tab_id, BottomDockTab::MfccUmapClusters));
+        }
+        4 => {
+            app.stage = AppStage::StartupHub;
         }
         _ => {
             app.selected_call_idx = if app.detected_calls.is_empty() { None } else { Some(0) };
@@ -867,6 +869,14 @@ impl SonoWingApp {
     fn render_top_menu_bar(&mut self, ctx: &egui::Context) {
         egui::TopBottomPanel::top("sonowing_top_menu").show(ctx, |ui| {
             egui::menu::bar(ui, |ui| {
+                if ui
+                    .button("<< Home / Presets")
+                    .on_hover_text("Return to Startup Quick-Start & Preset Hub")
+                    .clicked()
+                {
+                    self.stage = AppStage::StartupHub;
+                }
+                ui.separator();
                 ui.strong("SonoWing v1.1.0");
                 ui.separator();
 
@@ -1005,94 +1015,535 @@ impl SonoWingApp {
     }
 
     fn render_startup_hub(&mut self, ctx: &egui::Context) {
-        egui::CentralPanel::default().show(ctx, |ui| {
-            egui::ScrollArea::vertical().show(ui, |ui| {
-                ui.add_space(10.0);
-                ui.heading(
-                    "SonoWing v1.1.0 — Bat & Bird Sonic Waveform, MFCC/UMAP & Harmonic Workstation",
-                );
-                ui.label(
-                    "Full-spectrum & zero-crossing ultrasonic bat echolocation + avian flight-call/song analyzer with unsupervised MFCC/UMAP repertoire clustering, multi-harmonic stack tracking, and live microphone capture.",
-                );
-                ui.add_space(8.0);
-
-                ui.horizontal(|ui| {
-                    ui.label("Open WAV / ZC Path:");
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.file_path_input)
-                            .desired_width(360.0)
-                            .hint_text("/path/to/AudioMoth_384kHz.wav or sequence.zc"),
-                    );
-                    if ui.button("Load File").clicked() && !self.file_path_input.trim().is_empty() {
-                        let p = PathBuf::from(self.file_path_input.trim());
-                        self.load_external_path(&p);
-                    }
-                    if ui.button("Start Hardware Live Mic").clicked() {
-                        self.last_live_refresh = Instant::now();
-                        match self
-                            .live_mic
-                            .start_hardware_capture(self.mic_window_seconds, self.mic_prefer_ultrasonic)
-                        {
-                            Ok(desc) => {
-                                self.stage = AppStage::Workstation;
-                                self.status_banner = format!("Live Mic Active: {desc}");
-                            }
-                            Err(e) => {
-                                let lbl = self
-                                    .live_mic
-                                    .start_simulated_stream(self.mic_window_seconds, true);
-                                self.stage = AppStage::Workstation;
-                                self.status_banner =
-                                    format!("Hardware mic unavailable ({e}); launched {lbl}");
-                            }
-                        }
-                    }
-                    if ui.button("Enter Spectrogram Workstation ->").clicked() {
-                        self.stage = AppStage::Workstation;
-                    }
-                });
-
-                ui.add_space(12.0);
-                ui.separator();
-                ui.subheading_label(
-                    "Calibrated Bioacoustic Benchmark Suites (9 Presets — Click Any Card to Launch)",
-                );
-                ui.add_space(6.0);
-
-                egui::Grid::new("hub_presets_grid")
-                    .num_columns(2)
-                    .spacing([14.0, 12.0])
+        let manual_path_id = egui::Id::new("sonowing_hub_manual_path_open");
+        egui::CentralPanel::default()
+            .frame(
+                egui::Frame::NONE
+                    .fill(Color32::from_rgb(13, 17, 25))
+                    .inner_margin(egui::Margin::same(16)),
+            )
+            .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        for (idx, preset) in BuiltinPreset::ALL.iter().enumerate() {
-                            egui::Frame::group(ui.style())
-                                .fill(Color32::from_rgb(20, 26, 36))
-                                .inner_margin(10.0)
-                                .show(ui, |ui| {
-                                    ui.set_min_width(460.0);
-                                    ui.strong(preset.title());
-                                    ui.label(preset.subtitle());
-                                    ui.add_space(4.0);
-                                    if ui
-                                        .button(format!("Launch {} in Spectrogram Lab", preset.code()))
-                                        .clicked()
+                        let avail_w = ui.available_width();
+                        let container_w = avail_w.min(1140.0).max(320.0);
+                        let side_pad = ((avail_w - container_w) * 0.5).max(0.0);
+
+                        ui.horizontal_top(|ui| {
+                            if side_pad > 0.5 {
+                                ui.add_space(side_pad);
+                            }
+                            ui.vertical(|ui| {
+                                ui.set_min_width(container_w);
+                                ui.set_max_width(container_w);
+                                ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+
+                                // 1. Top Hero Masthead
+                                egui::Frame::group(ui.style())
+                                    .fill(Color32::from_rgb(19, 27, 40))
+                                    .stroke(Stroke::new(1.0, Color32::from_rgb(46, 70, 96)))
+                                    .corner_radius(CornerRadius::same(8))
+                                    .inner_margin(egui::Margin::same(16))
+                                    .show(ui, |hero| {
+                                        let hero_w = hero.available_width().max(260.0);
+                                        hero.set_min_width(hero_w);
+                                        hero.set_max_width(hero_w);
+                                        hero.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+
+                                        hero.horizontal_wrapped(|bar| {
+                                            egui::Frame::NONE
+                                                .fill(Color32::from_rgb(28, 86, 110))
+                                                .corner_radius(CornerRadius::same(4))
+                                                .inner_margin(egui::Margin::symmetric(8, 3))
+                                                .show(bar, |p| {
+                                                    p.label(
+                                                        egui::RichText::new("SONOWING v1.1.0 • BIOACOUSTIC LAB")
+                                                            .size(11.0)
+                                                            .strong()
+                                                            .color(Color32::from_rgb(214, 246, 255)),
+                                                    );
+                                                });
+                                            bar.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |rhs| {
+                                                    if rhs
+                                                        .button("20-Species Reference Key (F1)")
+                                                        .clicked()
+                                                    {
+                                                        self.show_reference_modal = true;
+                                                    }
+                                                },
+                                            );
+                                        });
+                                        hero.add_space(8.0);
+                                        hero.label(
+                                            egui::RichText::new(
+                                                "Bat Echolocation & Avian Vocalization Workstation",
+                                            )
+                                            .size(22.0)
+                                            .strong()
+                                            .color(Color32::from_rgb(242, 247, 255)),
+                                        );
+                                        hero.add_space(4.0);
+                                        hero.label(
+                                            egui::RichText::new(
+                                                "Full-spectrum 8–500 kHz WAV & Anabat zero-crossing spectrogram analysis, multi-harmonic stack tracking (f0..5f0), unsupervised MFCC/UMAP repertoire clustering, GUANO v1.0 metadata, and live microphone capture.",
+                                            )
+                                            .size(13.0)
+                                            .color(Color32::from_rgb(176, 194, 218)),
+                                        );
+                                    });
+
+                                ui.add_space(12.0);
+
+                                // 2. Three-Column Quick-Start Row
+                                ui.columns(3, |cols| {
+                                    // Col 1: Open Recording
                                     {
-                                        self.load_preset(*preset);
-                                        self.stage = AppStage::Workstation;
+                                        let col = &mut cols[0];
+                                        let col_w = col.available_width().max(180.0);
+                                        col.set_max_width(col_w);
+                                        col.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                                        egui::Frame::group(col.style())
+                                            .fill(Color32::from_rgb(20, 26, 36))
+                                            .stroke(Stroke::new(1.0, Color32::from_rgb(44, 58, 80)))
+                                            .corner_radius(CornerRadius::same(7))
+                                            .inner_margin(egui::Margin::same(12))
+                                            .show(col, |card| {
+                                                let cw = card.available_width().max(160.0);
+                                                card.set_min_width(cw);
+                                                card.set_max_width(cw);
+                                                card.set_min_height(158.0);
+                                                card.style_mut().wrap_mode =
+                                                    Some(egui::TextWrapMode::Wrap);
+
+                                                card.label(
+                                                    egui::RichText::new("1. Open Recording")
+                                                        .size(14.5)
+                                                        .strong()
+                                                        .color(Color32::from_rgb(142, 224, 212)),
+                                                );
+                                                card.add_space(6.0);
+                                                if card
+                                                    .add_sized(
+                                                        [cw, 28.0],
+                                                        egui::Button::new("Browse WAV / ZC File..."),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    if let Some(path) = rfd::FileDialog::new()
+                                                        .add_filter(
+                                                            "Bioacoustic Audio",
+                                                            &["wav", "WAV", "zc", "ZCF", "zcf"],
+                                                        )
+                                                        .pick_file()
+                                                    {
+                                                        self.file_path_input =
+                                                            path.display().to_string();
+                                                        self.load_external_path(&path);
+                                                    }
+                                                }
+                                                card.add_space(4.0);
+                                                if card
+                                                    .add_sized(
+                                                        [cw, 26.0],
+                                                        egui::Button::new("Load Demo WAV"),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    let demo = PathBuf::from(
+                                                        "samples/MYLU_Willamette_Demo_250kHz.wav",
+                                                    );
+                                                    if demo.exists() {
+                                                        self.file_path_input =
+                                                            demo.display().to_string();
+                                                        self.load_external_path(&demo);
+                                                    } else {
+                                                        self.load_preset(
+                                                            BuiltinPreset::B1MyluFeedingBuzz,
+                                                        );
+                                                        self.stage = AppStage::Workstation;
+                                                    }
+                                                }
+                                                card.add_space(4.0);
+                                                card.label(
+                                                    egui::RichText::new(
+                                                        "Tip: drag & drop any .wav or .zc file onto the window.",
+                                                    )
+                                                    .size(11.5)
+                                                    .color(Color32::from_rgb(154, 170, 192)),
+                                                );
+                                                card.add_space(4.0);
+                                                egui::CollapsingHeader::new("Enter manual file path")
+                                                    .id_salt(manual_path_id)
+                                                    .default_open(false)
+                                                    .show(card, |manual| {
+                                                        let mw = manual.available_width().max(120.0);
+                                                        manual.add(
+                                                            egui::TextEdit::singleline(
+                                                                &mut self.file_path_input,
+                                                            )
+                                                            .desired_width(mw)
+                                                            .hint_text("path/to/recording.wav"),
+                                                        );
+                                                        manual.add_space(4.0);
+                                                        if manual.button("Load Path").clicked()
+                                                            && !self
+                                                                .file_path_input
+                                                                .trim()
+                                                                .is_empty()
+                                                        {
+                                                            let p = PathBuf::from(
+                                                                self.file_path_input.trim(),
+                                                            );
+                                                            self.load_external_path(&p);
+                                                        }
+                                                    });
+                                            });
+                                    }
+
+                                    // Col 2: Live Acoustic Capture
+                                    {
+                                        let col = &mut cols[1];
+                                        let col_w = col.available_width().max(180.0);
+                                        col.set_max_width(col_w);
+                                        col.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                                        egui::Frame::group(col.style())
+                                            .fill(Color32::from_rgb(20, 26, 36))
+                                            .stroke(Stroke::new(1.0, Color32::from_rgb(44, 58, 80)))
+                                            .corner_radius(CornerRadius::same(7))
+                                            .inner_margin(egui::Margin::same(12))
+                                            .show(col, |card| {
+                                                let cw = card.available_width().max(160.0);
+                                                card.set_min_width(cw);
+                                                card.set_max_width(cw);
+                                                card.set_min_height(158.0);
+                                                card.style_mut().wrap_mode =
+                                                    Some(egui::TextWrapMode::Wrap);
+
+                                                card.label(
+                                                    egui::RichText::new("2. Live Acoustic Capture")
+                                                        .size(14.5)
+                                                        .strong()
+                                                        .color(Color32::from_rgb(138, 198, 255)),
+                                                );
+                                                card.add_space(6.0);
+                                                if card
+                                                    .add_sized(
+                                                        [cw, 28.0],
+                                                        egui::Button::new("Start Hardware Mic"),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    self.last_live_refresh = Instant::now();
+                                                    match self.live_mic.start_hardware_capture(
+                                                        self.mic_window_seconds,
+                                                        self.mic_prefer_ultrasonic,
+                                                    ) {
+                                                        Ok(desc) => {
+                                                            self.stage = AppStage::Workstation;
+                                                            self.status_banner =
+                                                                format!("Live Mic Active: {desc}");
+                                                        }
+                                                        Err(e) => {
+                                                            let lbl = self
+                                                                .live_mic
+                                                                .start_simulated_stream(
+                                                                    self.mic_window_seconds,
+                                                                    true,
+                                                                );
+                                                            self.stage = AppStage::Workstation;
+                                                            self.status_banner = format!(
+                                                                "Hardware mic unavailable ({e}); launched {lbl}"
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                                card.add_space(4.0);
+                                                if card
+                                                    .add_sized(
+                                                        [cw, 26.0],
+                                                        egui::Button::new(
+                                                            "Simulated 192 kHz Live Stream",
+                                                        ),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    self.last_live_refresh = Instant::now();
+                                                    let lbl = self.live_mic.start_simulated_stream(
+                                                        self.mic_window_seconds,
+                                                        true,
+                                                    );
+                                                    self.stage = AppStage::Workstation;
+                                                    self.status_banner =
+                                                        format!("Streaming: {lbl}");
+                                                }
+                                                card.add_space(4.0);
+                                                card.checkbox(
+                                                    &mut self.mic_prefer_ultrasonic,
+                                                    "Prefer USB UAC2 ultrasonic rate (up to 384 kHz)",
+                                                );
+                                            });
+                                    }
+
+                                    // Col 3: Saved Sessions & Blank Lab
+                                    {
+                                        let col = &mut cols[2];
+                                        let col_w = col.available_width().max(180.0);
+                                        col.set_max_width(col_w);
+                                        col.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
+                                        egui::Frame::group(col.style())
+                                            .fill(Color32::from_rgb(20, 26, 36))
+                                            .stroke(Stroke::new(1.0, Color32::from_rgb(44, 58, 80)))
+                                            .corner_radius(CornerRadius::same(7))
+                                            .inner_margin(egui::Margin::same(12))
+                                            .show(col, |card| {
+                                                let cw = card.available_width().max(160.0);
+                                                card.set_min_width(cw);
+                                                card.set_max_width(cw);
+                                                card.set_min_height(158.0);
+                                                card.style_mut().wrap_mode =
+                                                    Some(egui::TextWrapMode::Wrap);
+
+                                                card.label(
+                                                    egui::RichText::new(
+                                                        "3. Saved Sessions & Blank Lab",
+                                                    )
+                                                    .size(14.5)
+                                                    .strong()
+                                                    .color(Color32::from_rgb(235, 198, 128)),
+                                                );
+                                                card.add_space(6.0);
+                                                let lab_btn = egui::Button::new(
+                                                    egui::RichText::new(
+                                                        "Enter Spectrogram Lab >>",
+                                                    )
+                                                    .strong()
+                                                    .color(Color32::from_rgb(10, 18, 26)),
+                                                )
+                                                .fill(Color32::from_rgb(104, 224, 198));
+                                                if card.add_sized([cw, 28.0], lab_btn).clicked() {
+                                                    self.stage = AppStage::Workstation;
+                                                }
+                                                card.add_space(4.0);
+                                                if card
+                                                    .add_sized(
+                                                        [cw, 26.0],
+                                                        egui::Button::new(format!(
+                                                            "Saved SQLite Sessions ({}) [F9]",
+                                                            self.recent_sessions.len()
+                                                        )),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    self.refresh_sessions_list();
+                                                    self.show_sessions_modal = true;
+                                                }
+                                                card.add_space(4.0);
+                                                card.label(
+                                                    egui::RichText::new(
+                                                        "Sessions store GUANO v1.0 metadata, MFCC/UMAP clusters & Raven Pro selections in SQLite WAL.",
+                                                    )
+                                                    .size(11.5)
+                                                    .color(Color32::from_rgb(154, 170, 192)),
+                                                );
+                                            });
                                     }
                                 });
-                            if idx % 2 == 1 {
-                                ui.end_row();
-                            }
-                        }
-                    });
 
-                ui.add_space(14.0);
-                ui.label(
-                    egui::RichText::new(&self.status_banner)
-                        .color(Color32::from_rgb(185, 205, 230)),
-                );
+                                ui.add_space(16.0);
+                                ui.separator();
+                                ui.add_space(8.0);
+
+                                // 3. Categorized Responsive Preset Card Sections
+                                let n_cols = if container_w >= 900.0 {
+                                    3
+                                } else if container_w >= 580.0 {
+                                    2
+                                } else {
+                                    1
+                                };
+
+                                for category in PresetCategory::ALL {
+                                    let presets: Vec<BuiltinPreset> = BuiltinPreset::ALL
+                                        .into_iter()
+                                        .filter(|p| p.category() == category)
+                                        .collect();
+
+                                    let [tr, tg, tb] = category.tag_rgb();
+                                    ui.horizontal(|hdr| {
+                                        egui::Frame::NONE
+                                            .fill(Color32::from_rgb(tr, tg, tb))
+                                            .corner_radius(CornerRadius::same(4))
+                                            .inner_margin(egui::Margin::symmetric(7, 2))
+                                            .show(hdr, |p| {
+                                                p.label(
+                                                    egui::RichText::new(category.tag())
+                                                        .size(10.5)
+                                                        .strong()
+                                                        .color(Color32::WHITE),
+                                                );
+                                            });
+                                        hdr.label(
+                                            egui::RichText::new(category.heading())
+                                                .size(16.5)
+                                                .strong()
+                                                .color(Color32::from_rgb(230, 240, 252)),
+                                        );
+                                    });
+                                    ui.label(
+                                        egui::RichText::new(category.description())
+                                            .size(12.0)
+                                            .color(Color32::from_rgb(154, 172, 196)),
+                                    );
+                                    ui.add_space(8.0);
+
+                                    for chunk in presets.chunks(n_cols) {
+                                        ui.columns(n_cols, |cols| {
+                                            for (col_idx, preset) in chunk.iter().enumerate() {
+                                                let col_ui = &mut cols[col_idx];
+                                                let col_w = col_ui.available_width().max(180.0);
+                                                col_ui.set_max_width(col_w);
+                                                col_ui.style_mut().wrap_mode =
+                                                    Some(egui::TextWrapMode::Wrap);
+
+                                                let meta = preset.hub_meta();
+                                                let [pr, pg, pb] = meta.pill_rgb;
+                                                let pill_col = Color32::from_rgb(pr, pg, pb);
+
+                                                egui::Frame::group(col_ui.style())
+                                                    .fill(Color32::from_rgb(20, 27, 38))
+                                                    .stroke(Stroke::new(
+                                                        1.0,
+                                                        Color32::from_rgb(44, 58, 80),
+                                                    ))
+                                                    .corner_radius(CornerRadius::same(7))
+                                                    .inner_margin(egui::Margin::same(12))
+                                                    .show(col_ui, |card| {
+                                                        let inner_w =
+                                                            card.available_width().max(150.0);
+                                                        card.set_min_width(inner_w);
+                                                        card.set_max_width(inner_w);
+                                                        card.style_mut().wrap_mode =
+                                                            Some(egui::TextWrapMode::Wrap);
+
+                                                        card.horizontal_wrapped(|row| {
+                                                            egui::Frame::NONE
+                                                                .fill(pill_col)
+                                                                .corner_radius(
+                                                                    CornerRadius::same(4),
+                                                                )
+                                                                .inner_margin(
+                                                                    egui::Margin::symmetric(7, 2),
+                                                                )
+                                                                .show(row, |p| {
+                                                                    p.label(
+                                                                        egui::RichText::new(
+                                                                            meta.taxon_rate_pill,
+                                                                        )
+                                                                        .size(10.5)
+                                                                        .strong()
+                                                                        .color(Color32::WHITE),
+                                                                    );
+                                                                });
+                                                            egui::Frame::NONE
+                                                                .fill(Color32::from_rgb(35, 45, 62))
+                                                                .corner_radius(
+                                                                    CornerRadius::same(4),
+                                                                )
+                                                                .inner_margin(
+                                                                    egui::Margin::symmetric(7, 2),
+                                                                )
+                                                                .show(row, |p| {
+                                                                    p.label(
+                                                                        egui::RichText::new(
+                                                                            meta.band_code,
+                                                                        )
+                                                                        .monospace()
+                                                                        .size(10.5)
+                                                                        .strong()
+                                                                        .color(Color32::from_rgb(
+                                                                            198, 218, 242,
+                                                                        )),
+                                                                    );
+                                                                });
+                                                        });
+
+                                                        card.add_space(6.0);
+                                                        card.label(
+                                                            egui::RichText::new(meta.common_name)
+                                                                .size(14.5)
+                                                                .strong()
+                                                                .color(Color32::from_rgb(
+                                                                    240, 246, 255,
+                                                                )),
+                                                        );
+                                                        card.label(
+                                                            egui::RichText::new(
+                                                                meta.scientific_name,
+                                                            )
+                                                            .italics()
+                                                            .size(12.0)
+                                                            .color(Color32::from_rgb(
+                                                                134, 206, 242,
+                                                            )),
+                                                        );
+                                                        card.add_space(5.0);
+                                                        card.allocate_ui_with_layout(
+                                                            Vec2::new(inner_w, 46.0),
+                                                            egui::Layout::top_down(
+                                                                egui::Align::Min,
+                                                            ),
+                                                            |sig_ui| {
+                                                                sig_ui.set_max_width(inner_w);
+                                                                sig_ui.style_mut().wrap_mode =
+                                                                    Some(egui::TextWrapMode::Wrap);
+                                                                sig_ui.label(
+                                                                    egui::RichText::new(
+                                                                        meta.signature,
+                                                                    )
+                                                                    .size(11.8)
+                                                                    .color(Color32::from_rgb(
+                                                                        182, 196, 218,
+                                                                    )),
+                                                                );
+                                                            },
+                                                        );
+                                                        card.add_space(8.0);
+                                                        let btn = egui::Button::new(
+                                                            egui::RichText::new(
+                                                                "Launch in Spectrogram Lab >>",
+                                                            )
+                                                            .strong()
+                                                            .color(Color32::from_rgb(12, 18, 26)),
+                                                        )
+                                                        .fill(Color32::from_rgb(104, 224, 198));
+                                                        if card
+                                                            .add_sized([inner_w, 28.0], btn)
+                                                            .clicked()
+                                                        {
+                                                            self.load_preset(*preset);
+                                                            self.stage = AppStage::Workstation;
+                                                        }
+                                                    });
+                                            }
+                                        });
+                                        ui.add_space(10.0);
+                                    }
+                                    ui.add_space(6.0);
+                                }
+
+                                ui.add_space(6.0);
+                                ui.label(
+                                    egui::RichText::new(&self.status_banner)
+                                        .size(12.0)
+                                        .color(Color32::from_rgb(172, 196, 222)),
+                                );
+                            });
+                        });
+                    });
             });
-        });
     }
 
     fn render_left_dsp_panel(&mut self, ctx: &egui::Context) {
@@ -2541,21 +2992,6 @@ impl SonoWingApp {
             open = false;
         }
         self.show_sessions_modal = open;
-    }
-}
-
-trait UiSubheadingExt {
-    fn subheading_label(&mut self, text: &str);
-}
-
-impl UiSubheadingExt for egui::Ui {
-    fn subheading_label(&mut self, text: &str) {
-        self.label(
-            egui::RichText::new(text)
-                .size(15.5)
-                .strong()
-                .color(Color32::from_rgb(148, 214, 200)),
-        );
     }
 }
 
