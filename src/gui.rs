@@ -1,3 +1,18 @@
+// Copyright (C) 2026 CRV Science Network (https://crvscience.com)
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://gnu.org>.
+
 //! Native `eframe` / `egui` `0.31` Bioacoustic Sonic & Ultrasonic Workstation (`v1.1.0`):
 //! - Startup Calibration Hub (`AppStage::StartupHub`, 9 presets, bypassable via `--skip-hub`)
 //! - Live Microphone Spectrogram Stream (`cpal` USB/Ultrasonic UAC2 + Simulated 192 kHz stream + Freeze Buffer)

@@ -1,3 +1,18 @@
+// Copyright (C) 2026 CRV Science Network (https://crvscience.com)
+//
+// This program is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// This program is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+// GNU General Public License for more details.
+//
+// You should have received a copy of the GNU General Public License
+// along with this program.  If not, see <https://gnu.org>.
+
 //! Pure-Rust RIFF/WAV (8/16/24/32-bit PCM & 32-bit IEEE float, 8 kHz to 500 kHz),
 //! GUANO v1.0 (`guan` subchunk) metadata reader/writer, AudioMoth `LIST/INFO`
 //! parser, and Titley Anabat Zero-Crossing (`.zc` / `.zcf`) sequence handler.
