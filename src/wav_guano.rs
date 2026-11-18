@@ -132,7 +132,7 @@ impl GuanoMetadata {
                         .filter(|s| !s.is_empty())
                         .collect();
                 }
-                "Note" => meta.note = Some(val.to_string()),
+                "Note" => meta.note = Some(val.replace("\\n", "\n")),
                 other => {
                     meta.extra_fields.insert(other.to_string(), val.to_string());
                 }

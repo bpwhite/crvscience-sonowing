@@ -307,6 +307,10 @@ pub fn write_calls_csv(
 pub struct WorksetPayload {
     pub schema_version: String,
     pub source_name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preset_code: Option<String>,
     pub sample_rate_hz: u32,
     pub duration_s: f64,
     pub guano: Option<GuanoMetadata>,
@@ -326,23 +330,27 @@ pub struct SignedWorksetEnvelope {
 
 impl SignedWorksetEnvelope {
     pub fn build(payload: WorksetPayload) -> Result<Self, String> {
-        let canonical =
+        let raw =
             serde_json::to_string(&payload).map_err(|e| format!("JSON serialize error: {e}"))?;
+        let normalized: WorksetPayload =
+            serde_json::from_str(&raw).map_err(|e| format!("JSON normalize error: {e}"))?;
+        let canonical = Self::canonical_payload_json(&normalized)?;
         let sha256_hex = sha256_string(&canonical);
         Ok(Self {
-            payload,
+            payload: normalized,
             sha256_hex,
         })
     }
 
     pub fn verify(&self) -> Result<bool, String> {
-        let canonical = serde_json::to_string(&self.payload)
-            .map_err(|e| format!("JSON serialize error: {e}"))?;
+        let canonical = Self::canonical_payload_json(&self.payload)?;
         Ok(sha256_string(&canonical) == self.sha256_hex)
     }
 
     pub fn save_to_file(&self, path: &Path) -> Result<(), String> {
-        let pretty = serde_json::to_string_pretty(self)
+        let value = serde_json::to_value(self)
+            .map_err(|e| format!("JSON formatting error: {e}"))?;
+        let pretty = serde_json::to_string_pretty(&value)
             .map_err(|e| format!("JSON formatting error: {e}"))?;
         fs::write(path, pretty)
             .map_err(|e| format!("Failed writing workset '{}': {e}", path.display()))
@@ -357,6 +365,45 @@ impl SignedWorksetEnvelope {
             return Err("Workset SHA-256 integrity verification failed".to_string());
         }
         Ok(env)
+    }
+
+    pub fn canonical_payload_json(payload: &WorksetPayload) -> Result<String, String> {
+        let mut val =
+            serde_json::to_value(payload).map_err(|e| format!("JSON serialize error: {e}"))?;
+        canonicalize_json_value(&mut val);
+        serde_json::to_string(&val).map_err(|e| format!("JSON serialize error: {e}"))
+    }
+}
+
+fn canonicalize_json_value(v: &mut serde_json::Value) {
+    match v {
+        serde_json::Value::Number(num) => {
+            if num.is_f64() {
+                if let Some(f) = num.as_f64() {
+                    if !f.is_finite() || f == 0.0 {
+                        *num = serde_json::Number::from(0);
+                    } else {
+                        let rounded = format!("{f:.11e}");
+                        if let Ok(r) = rounded.parse::<f64>() {
+                            if let Some(rn) = serde_json::Number::from_f64(r) {
+                                *num = rn;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                canonicalize_json_value(item);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for val in map.values_mut() {
+                canonicalize_json_value(val);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -380,5 +427,58 @@ fn csv_escape(field: &str) -> String {
         format!("\"{}\"", field.replace('"', "\"\""))
     } else {
         field.to_string()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::call_extractor::{extract_calls, DetectorConfig};
+    use crate::dsp::{compute_stft, StftConfig};
+    use crate::harmonic_tracker::analyze_harmonic_stacks;
+    use crate::mfcc_cluster::{analyze_repertoire_clusters, ManifoldClusterConfig};
+    use crate::soundscape_indices::compute_soundscape_indices;
+    use crate::synth_presets::{synthesize_preset, BuiltinPreset};
+
+    #[test]
+    fn workset_canonical_roundtrip_preserves_sha256() {
+        let rec = synthesize_preset(BuiltinPreset::B1MyluFeedingBuzz);
+        let spec = compute_stft(
+            &rec.samples,
+            rec.sample_rate_hz,
+            StftConfig {
+                fft_size: 512,
+                hop_size: 64,
+                ..Default::default()
+            },
+        );
+        let calls = extract_calls(&rec.samples, &spec, DetectorConfig::default());
+        let harmonics = analyze_harmonic_stacks(&calls, &spec);
+        let clusters =
+            analyze_repertoire_clusters(&calls, &spec, ManifoldClusterConfig::default());
+        let indices = compute_soundscape_indices(&rec.samples, &spec);
+
+        let payload = WorksetPayload {
+            schema_version: "1.1.0".to_string(),
+            source_name: rec.source_name.clone(),
+            source_path: None,
+            preset_code: Some("B1".to_string()),
+            sample_rate_hz: rec.sample_rate_hz,
+            duration_s: rec.duration_s(),
+            guano: rec.guano.clone(),
+            detected_calls: calls,
+            harmonic_profiles: harmonics,
+            cluster_report: clusters,
+            soundscape_indices: indices,
+        };
+        let env = SignedWorksetEnvelope::build(payload).unwrap();
+        let before = SignedWorksetEnvelope::canonical_payload_json(&env.payload).unwrap();
+        let ws_path = std::env::temp_dir().join("sonowing_exporters_roundtrip_check.sonoworkset.json");
+        let _ = std::fs::remove_file(&ws_path);
+        env.save_to_file(&ws_path).unwrap();
+        let loaded = SignedWorksetEnvelope::load_verified(&ws_path).unwrap();
+        let after = SignedWorksetEnvelope::canonical_payload_json(&loaded.payload).unwrap();
+        let _ = std::fs::remove_file(&ws_path);
+        assert_eq!(before, after);
     }
 }

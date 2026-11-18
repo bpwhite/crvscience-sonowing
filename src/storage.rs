@@ -100,9 +100,41 @@ impl SonoWingRepository {
         clusters: &RepertoireClusterReport,
         indices: &SoundscapeIndices,
     ) -> Result<i64, String> {
+        self.save_session_with_source(
+            slot_name,
+            source_name,
+            None,
+            None,
+            sample_rate_hz,
+            duration_s,
+            guano,
+            calls,
+            harmonics,
+            clusters,
+            indices,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn save_session_with_source(
+        &self,
+        slot_name: &str,
+        source_name: &str,
+        source_path: Option<&str>,
+        preset_code: Option<&str>,
+        sample_rate_hz: u32,
+        duration_s: f64,
+        guano: Option<&GuanoMetadata>,
+        calls: &[DetectedCallEvent],
+        harmonics: &[HarmonicStackProfile],
+        clusters: &RepertoireClusterReport,
+        indices: &SoundscapeIndices,
+    ) -> Result<i64, String> {
         let payload = WorksetPayload {
             schema_version: "1.1.0".to_string(),
             source_name: source_name.to_string(),
+            source_path: source_path.map(|s| s.to_string()),
+            preset_code: preset_code.map(|s| s.to_string()),
             sample_rate_hz,
             duration_s,
             guano: guano.cloned(),
@@ -147,25 +179,27 @@ impl SonoWingRepository {
                 .get(idx)
                 .map(|h| h.hnr_db as f64)
                 .unwrap_or(0.0);
-            let _ = self.conn.execute(
-                "INSERT INTO vetted_calls_index (
-                    session_id, call_num, domain, begin_time_s, duration_ms,
-                    f_char_khz, f_max_khz, species_code, confidence, cluster_id, hnr_db
-                ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-                params![
-                    session_id,
-                    ev.id as i64,
-                    ev.domain.label(),
-                    ev.begin_time_s,
-                    ev.duration_ms,
-                    ev.f_char_khz,
-                    ev.f_max_khz,
-                    ev.primary_code(),
-                    ev.primary_confidence(),
-                    cid,
-                    hnr
-                ],
-            );
+            self.conn
+                .execute(
+                    "INSERT INTO vetted_calls_index (
+                        session_id, call_num, domain, begin_time_s, duration_ms,
+                        f_char_khz, f_max_khz, species_code, confidence, cluster_id, hnr_db
+                    ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                    params![
+                        session_id,
+                        ev.id as i64,
+                        ev.domain.label(),
+                        ev.begin_time_s,
+                        ev.duration_ms,
+                        ev.f_char_khz,
+                        ev.f_max_khz,
+                        ev.primary_code(),
+                        ev.primary_confidence(),
+                        cid,
+                        hnr
+                    ],
+                )
+                .map_err(|e| format!("SQLite vetted_calls_index insert failed: {e}"))?;
         }
 
         Ok(session_id)

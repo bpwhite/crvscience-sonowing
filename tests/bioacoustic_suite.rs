@@ -17,7 +17,7 @@
 //! Integration & analytical verification suite for SonoWing v1.1.0.
 
 use sonowing::call_extractor::{
-    extract_calls, BehavioralPhase, CallShapeTopology, DetectionMode, DetectorConfig, TaxonDomain,
+    extract_calls, BehavioralPhase, CallShapeTopology, DetectionMode, DetectorConfig,
 };
 use sonowing::dsp::{
     bandpass_zero_phase, compute_stft, compute_tkeo, extract_zero_crossing_dots,
@@ -27,6 +27,7 @@ use sonowing::exporters::{
     format_calls_and_summary_csv, format_raven_selection_table, SignedWorksetEnvelope,
     WorksetPayload,
 };
+use sonowing::gui::{AppStage, GuanoEditorDraft, SonoWingApp};
 use sonowing::harmonic_tracker::analyze_harmonic_stacks;
 use sonowing::live_mic::LiveMicEngine;
 use sonowing::mfcc_cluster::{
@@ -36,8 +37,9 @@ use sonowing::soundscape_indices::compute_soundscape_indices;
 use sonowing::storage::SonoWingRepository;
 use sonowing::synth_presets::{synthesize_preset, BuiltinPreset};
 use sonowing::ultrasonic_audio::{render_audible_recording, AuditionMode};
-use sonowing::wav_guano::{encode_wav_with_guano_bytes, parse_wav_bytes};
+use sonowing::wav_guano::{encode_wav_with_guano_bytes, load_wav_file, parse_wav_bytes};
 use std::f64::consts::TAU;
+use std::path::PathBuf;
 
 #[test]
 fn fft_parseval_energy_conservation_and_tkeo_sinusoid() {
@@ -233,6 +235,8 @@ fn exporters_v11_raven_csv_workset_and_sqlite_persistence() {
     let payload = WorksetPayload {
         schema_version: "1.1.0".to_string(),
         source_name: rec.source_name.clone(),
+        source_path: None,
+        preset_code: Some("M1".to_string()),
         sample_rate_hz: rec.sample_rate_hz,
         duration_s: rec.duration_s(),
         guano: rec.guano.clone(),
@@ -263,5 +267,255 @@ fn exporters_v11_raven_csv_workset_and_sqlite_persistence() {
     let loaded = repo.load_session_payload(id).expect("load session");
     assert_eq!(loaded.detected_calls.len(), calls.len());
     assert_eq!(loaded.harmonic_profiles.len(), harmonics.len());
+    let _ = std::fs::remove_file(&tmp_db);
+}
+
+#[test]
+fn demo_mylu_wav_classifies_as_mylu_without_subharmonic_halving() {
+    let demo_path = PathBuf::from("samples/MYLU_Willamette_Demo_250kHz.wav");
+    assert!(demo_path.exists(), "Demo WAV must exist at {}", demo_path.display());
+    let rec = load_wav_file(&demo_path).expect("load demo WAV");
+    let spec = compute_stft(
+        &rec.samples,
+        rec.sample_rate_hz,
+        StftConfig {
+            fft_size: 512,
+            hop_size: 64,
+            ..Default::default()
+        },
+    );
+    let calls = extract_calls(&rec.samples, &spec, DetectorConfig::default());
+    assert!(
+        calls.len() >= 5,
+        "Expected >= 5 pulses in demo WAV, got {}",
+        calls.len()
+    );
+    for (idx, ev) in calls.iter().take(3).enumerate() {
+        assert!(
+            (37.0..=45.0).contains(&ev.f_char_khz),
+            "Call #{} Fc should be ~40 kHz, got {}",
+            idx + 1,
+            ev.f_char_khz
+        );
+        assert!(
+            ev.f_min_khz >= 35.0,
+            "Call #{} Fmin should remain >=35 kHz, got {}",
+            idx + 1,
+            ev.f_min_khz
+        );
+        assert_eq!(ev.primary_code(), "MYLU");
+    }
+    assert!(
+        calls.iter().all(|c| c.primary_code() != "COTO"),
+        "Zero calls in MYLU demo WAV should misclassify as COTO"
+    );
+}
+
+#[test]
+fn workset_json_roundtrip_and_tamper_rejection() {
+    let rec = synthesize_preset(BuiltinPreset::B1MyluFeedingBuzz);
+    let spec = compute_stft(
+        &rec.samples,
+        rec.sample_rate_hz,
+        StftConfig {
+            fft_size: 512,
+            hop_size: 64,
+            ..Default::default()
+        },
+    );
+    let calls = extract_calls(&rec.samples, &spec, DetectorConfig::default());
+    let harmonics = analyze_harmonic_stacks(&calls, &spec);
+    let clusters = analyze_repertoire_clusters(&calls, &spec, ManifoldClusterConfig::default());
+    let indices = compute_soundscape_indices(&rec.samples, &spec);
+
+    let payload = WorksetPayload {
+        schema_version: "1.1.0".to_string(),
+        source_name: rec.source_name.clone(),
+        source_path: None,
+        preset_code: Some("B1".to_string()),
+        sample_rate_hz: rec.sample_rate_hz,
+        duration_s: rec.duration_s(),
+        guano: rec.guano.clone(),
+        detected_calls: calls.clone(),
+        harmonic_profiles: harmonics.clone(),
+        cluster_report: clusters.clone(),
+        soundscape_indices: indices.clone(),
+    };
+    let env = SignedWorksetEnvelope::build(payload).expect("build envelope");
+    let ws_path = std::env::temp_dir().join("sonowing_test_roundtrip.sonoworkset.json");
+    let _ = std::fs::remove_file(&ws_path);
+    env.save_to_file(&ws_path).expect("save workset");
+
+    let loaded = SignedWorksetEnvelope::load_verified(&ws_path).expect("verify roundtrip");
+    assert_eq!(loaded.payload.detected_calls.len(), calls.len());
+    assert_eq!(loaded.payload.harmonic_profiles.len(), harmonics.len());
+    assert_eq!(loaded.payload.cluster_report.optimal_k, clusters.optimal_k);
+
+    // Mutate one field in the JSON without recomputing sha256_hex
+    let raw = std::fs::read_to_string(&ws_path).expect("read json");
+    let tampered = raw.replacen("MYLU", "COTO", 1);
+    assert_ne!(raw, tampered);
+    std::fs::write(&ws_path, tampered).expect("write tampered json");
+    let err = SignedWorksetEnvelope::load_verified(&ws_path).unwrap_err();
+    assert!(
+        err.contains("SHA-256"),
+        "Expected SHA-256 tamper error, got: {err}"
+    );
+    let _ = std::fs::remove_file(&ws_path);
+}
+
+#[test]
+fn guano_editor_draft_validation_and_wav_roundtrip() {
+    let rec = synthesize_preset(BuiltinPreset::B1MyluFeedingBuzz);
+    let mut draft =
+        GuanoEditorDraft::from_guano(rec.guano.as_ref(), rec.sample_rate_hz, rec.duration_s());
+    draft.species_manual_id = "MYLU, MYEV".to_string();
+    draft.loc_lat = "44.564566".to_string();
+    draft.loc_lon = "-123.262044".to_string();
+    draft.make = "Pettersson".to_string();
+    draft.model = "M500-384".to_string();
+    draft.note = "Riparian roost exit\n250 kHz full spectrum".to_string();
+
+    let edited_guano = draft.to_guano(rec.duration_s()).expect("valid guano draft");
+    let wav_bytes =
+        encode_wav_with_guano_bytes(&rec.samples, rec.sample_rate_hz, Some(&edited_guano));
+    let decoded = parse_wav_bytes(&wav_bytes, "edited.wav").expect("decode edited wav");
+    let g = decoded.guano.expect("decoded guano");
+    assert_eq!(g.species_manual_id, vec!["MYLU", "MYEV"]);
+    assert_eq!(g.make.as_deref(), Some("Pettersson"));
+    assert_eq!(g.model.as_deref(), Some("M500-384"));
+    assert_eq!(
+        g.note.as_deref(),
+        Some("Riparian roost exit\n250 kHz full spectrum")
+    );
+    let (lat, lon) = g.loc_position.expect("loc position");
+    assert!((lat - 44.564566).abs() < 1e-5 && (lon + 123.262044).abs() < 1e-5);
+
+    // Invalid bounds must fail cleanly
+    let mut bad_lat = draft.clone();
+    bad_lat.loc_lat = "95.0".to_string();
+    assert!(bad_lat.to_guano(rec.duration_s()).is_err());
+
+    let mut bad_sr = draft;
+    bad_sr.samplerate_hz = "not_a_number".to_string();
+    assert!(bad_sr.to_guano(rec.duration_s()).is_err());
+}
+
+#[test]
+fn sqlite_session_reload_and_workset_import_recomputes_spectrogram_and_preserves_vetting() {
+    let demo_wav = PathBuf::from("samples/MYLU_Willamette_Demo_250kHz.wav");
+    assert!(demo_wav.exists());
+    let tmp_db = std::env::temp_dir().join(format!(
+        "sonowing_reload_test_{}.sqlite3",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&tmp_db);
+
+    let ctx = egui::Context::default();
+    let mut app = SonoWingApp::new_headless(&ctx, Some(demo_wav), true, tmp_db.clone());
+    assert_eq!(app.raw_recording.sample_rate_hz, 250_000);
+    assert!(!app.detected_calls.is_empty());
+    app.detected_calls[0].manual_vetted_code = Some("MYLU".to_string());
+    app.slot_name_input = "Willamette Reload Slot".to_string();
+    app.quick_save_sqlite();
+
+    // Also save a signed workset for import test
+    let ws_path = std::env::temp_dir().join(format!(
+        "sonowing_import_test_{}.sonoworkset.json",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&ws_path);
+    let ws_payload = WorksetPayload {
+        schema_version: "1.1.0".to_string(),
+        source_name: app.raw_recording.source_name.clone(),
+        source_path: app
+            .current_source_path
+            .as_ref()
+            .map(|p| p.display().to_string()),
+        preset_code: None,
+        sample_rate_hz: app.raw_recording.sample_rate_hz,
+        duration_s: app.raw_recording.duration_s(),
+        guano: app.raw_recording.guano.clone(),
+        detected_calls: app.detected_calls.clone(),
+        harmonic_profiles: app.harmonic_profiles.clone(),
+        cluster_report: app.cluster_report.clone(),
+        soundscape_indices: app.soundscape_indices.clone(),
+    };
+    SignedWorksetEnvelope::build(ws_payload)
+        .unwrap()
+        .save_to_file(&ws_path)
+        .unwrap();
+
+    // Switch to an unrelated 48 kHz avian preset
+    app.load_preset(BuiltinPreset::A1SwthYrwaNightFlight);
+    assert_eq!(app.raw_recording.sample_rate_hz, 48_000);
+    assert_eq!(app.spectrogram.sample_rate_hz, 48_000);
+
+    // Reload SQLite session #1
+    app.load_sqlite_session(1);
+    assert_eq!(app.raw_recording.sample_rate_hz, 250_000);
+    assert_eq!(app.raw_recording.samples.len(), 70_000);
+    assert_eq!(app.spectrogram.sample_rate_hz, 250_000);
+    assert!(app.spec_dirty, "spec_dirty must be set on session reload");
+    assert!(!app.has_spec_texture(), "stale spec_texture must be cleared");
+    assert!((app.view_end_s - 0.280).abs() < 1e-3);
+    assert!((app.freq_max_khz - 125.0).abs() < 0.5);
+    assert_eq!(app.stage, AppStage::Workstation);
+    assert_eq!(
+        app.detected_calls[0].manual_vetted_code.as_deref(),
+        Some("MYLU")
+    );
+
+    // Switch to 384 kHz RHFE preset, then import .sonoworkset.json
+    app.load_preset(BuiltinPreset::B4RhfeHorseshoeCf);
+    assert_eq!(app.raw_recording.sample_rate_hz, 384_000);
+    app.import_workset_from_path(&ws_path);
+    assert_eq!(app.raw_recording.sample_rate_hz, 250_000);
+    assert_eq!(app.spectrogram.sample_rate_hz, 250_000);
+    assert!(app.spec_dirty);
+    assert_eq!(
+        app.detected_calls[0].manual_vetted_code.as_deref(),
+        Some("MYLU")
+    );
+
+    let _ = std::fs::remove_file(&ws_path);
+    let _ = std::fs::remove_file(&tmp_db);
+}
+
+#[test]
+fn sqlite_session_reload_missing_wav_surfaces_error_gracefully() {
+    let rec = synthesize_preset(BuiltinPreset::B1MyluFeedingBuzz);
+    let tmp_wav = std::env::temp_dir().join(format!(
+        "sonowing_ephemeral_missing_{}.wav",
+        std::process::id()
+    ));
+    let wav_bytes = encode_wav_with_guano_bytes(&rec.samples, rec.sample_rate_hz, rec.guano.as_ref());
+    std::fs::write(&tmp_wav, wav_bytes).expect("write temp wav");
+
+    let tmp_db = std::env::temp_dir().join(format!(
+        "sonowing_missing_wav_{}.sqlite3",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&tmp_db);
+
+    let ctx = egui::Context::default();
+    let mut app = SonoWingApp::new_headless(&ctx, Some(tmp_wav.clone()), true, tmp_db.clone());
+    app.quick_save_sqlite();
+
+    // Delete the temp WAV and switch to 48 kHz preset
+    std::fs::remove_file(&tmp_wav).expect("remove temp wav");
+    app.load_preset(BuiltinPreset::A1SwthYrwaNightFlight);
+
+    // Reloading should not panic, should clear old preset spectrogram, and surface missing WAV in status_banner
+    app.load_sqlite_session(1);
+    assert!(
+        app.status_banner.contains("could not be reloaded")
+            || app.status_banner.contains("does not exist"),
+        "Expected missing-WAV warning in status_banner, got: {}",
+        app.status_banner
+    );
+    assert_eq!(app.spectrogram.sample_rate_hz, 250_000);
+    assert!(app.spec_dirty);
+
     let _ = std::fs::remove_file(&tmp_db);
 }

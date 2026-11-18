@@ -13,7 +13,8 @@
 // You should have received a copy of the GNU General Public License
 // along with this program.  If not, see <https://gnu.org>.
 
-#![forbid(unsafe_code)]
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![deny(unsafe_code)]
 //! # SonoWing (`sonowing` v1.1.0) Entry Point
 //!
 //! Launches the native `eframe`/`egui` 0.31 desktop bioacoustic workstation when invoked
@@ -155,7 +156,55 @@ enum CliAuditionMode {
     Fdiv,
 }
 
+#[cfg(windows)]
+#[allow(unsafe_code)]
+fn attach_parent_console_if_cli() {
+    if std::env::args_os().len() > 1 {
+        const ATTACH_PARENT_PROCESS: u32 = u32::MAX;
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn AttachConsole(dwProcessId: u32) -> i32;
+        }
+        // SAFETY: Passing ATTACH_PARENT_PROCESS (-1 as u32) attaches stdout/stderr to the
+        // invoking console when CLI arguments are present; failure (e.g. redirected pipes or
+        // GUI launch) is harmlessly ignored.
+        unsafe {
+            let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+        }
+    }
+}
+
+fn load_embedded_app_icon() -> Option<eframe::egui::IconData> {
+    let bytes: &[u8] = include_bytes!("../assets/sonowing_icon.png");
+    let decoder = png::Decoder::new(std::io::Cursor::new(bytes));
+    let mut reader = decoder.read_info().ok()?;
+    let mut buf = vec![0u8; reader.output_buffer_size()?];
+    let info = reader.next_frame(&mut buf).ok()?;
+    let raw = &buf[..info.buffer_size()];
+    let rgba = match info.color_type {
+        png::ColorType::Rgba => raw.to_vec(),
+        png::ColorType::Rgb => raw
+            .chunks_exact(3)
+            .flat_map(|rgb| [rgb[0], rgb[1], rgb[2], 255])
+            .collect(),
+        png::ColorType::GrayscaleAlpha => raw
+            .chunks_exact(2)
+            .flat_map(|ga| [ga[0], ga[0], ga[0], ga[1]])
+            .collect(),
+        png::ColorType::Grayscale => raw.iter().flat_map(|&g| [g, g, g, 255]).collect(),
+        png::ColorType::Indexed => return None,
+    };
+    Some(eframe::egui::IconData {
+        rgba,
+        width: info.width,
+        height: info.height,
+    })
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    #[cfg(windows)]
+    attach_parent_console_if_cli();
+
     let cli = Cli::parse();
 
     if let Some(out_path) = &cli.headless_screenshot {
@@ -301,13 +350,18 @@ fn launch_gui(
     skip_hub: bool,
     db_path: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let mut viewport = eframe::egui::ViewportBuilder::default()
+        .with_inner_size([1480.0, 920.0])
+        .with_min_inner_size([1080.0, 700.0])
+        .with_title(
+            "SonoWing v1.1.0 — Bat & Bird Bioacoustic Waveform, MFCC/UMAP & Harmonic Analyzer",
+        );
+    if let Some(icon) = load_embedded_app_icon() {
+        viewport = viewport.with_icon(std::sync::Arc::new(icon));
+    }
+
     let native_options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_inner_size([1480.0, 920.0])
-            .with_min_inner_size([1080.0, 700.0])
-            .with_title(
-                "SonoWing v1.1.0 — Bat & Bird Bioacoustic Waveform, MFCC/UMAP & Harmonic Analyzer",
-            ),
+        viewport,
         ..Default::default()
     };
 
@@ -562,4 +616,24 @@ fn run_batch(dir: &Path, out_dir: &Path, snr_db: f32) -> Result<(), String> {
         manifest_path.display()
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::load_embedded_app_icon;
+
+    #[test]
+    fn embedded_app_icon_and_ico_header_are_valid() {
+        let icon = load_embedded_app_icon().expect("embedded PNG icon must decode");
+        assert_eq!(icon.width, 128);
+        assert_eq!(icon.height, 128);
+        assert_eq!(icon.rgba.len(), (icon.width * icon.height * 4) as usize);
+        assert!(icon.rgba.iter().any(|&b| b > 0));
+
+        let ico_bytes: &[u8] = include_bytes!("../assets/sonowing.ico");
+        assert!(ico_bytes.len() >= 22);
+        assert_eq!(&ico_bytes[0..4], &[0x00, 0x00, 0x01, 0x00]);
+        let count = u16::from_le_bytes([ico_bytes[4], ico_bytes[5]]);
+        assert!(count >= 4, "Expected >= 4 ICO sizes, got {count}");
+    }
 }

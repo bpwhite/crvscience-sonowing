@@ -38,15 +38,18 @@ use crate::soundscape_indices::{compute_soundscape_indices, SoundscapeIndices};
 use crate::storage::{SavedSessionSummary, SonoWingRepository};
 use crate::synth_presets::{synthesize_preset, BuiltinPreset, PresetCategory};
 use crate::taxa_library::reference_species_catalog;
-use crate::ultrasonic_audio::{render_audible_recording, AuditionMode};
+use crate::ultrasonic_audio::{
+    render_audible_recording, AuditionMode, UltrasonicAudioPlayer,
+};
 use crate::wav_guano::{
     load_wav_file, load_zc_dot_table, reconstruct_waveform_from_zc, write_wav_with_guano,
-    write_zc_dot_table, BioAcousticRecording, ZeroCrossDot, ZeroCrossSequence,
+    write_zc_dot_table, BioAcousticRecording, GuanoMetadata, ZeroCrossDot, ZeroCrossSequence,
 };
 use eframe::egui::{
     self, Color32, ColorImage, CornerRadius, FontId, Pos2, Rect, Sense, Stroke, StrokeKind,
     TextureHandle, TextureOptions, Vec2,
 };
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -135,7 +138,160 @@ enum BottomDockTab {
     MfccUmapClusters,
     ZeroCrossingTrace,
     SoundscapeIndices,
+    GuanoMetadata,
     AuditionAndExport,
+}
+
+#[derive(Debug, Clone)]
+pub struct GuanoEditorDraft {
+    pub species_auto_id: String,
+    pub species_manual_id: String,
+    pub timestamp: String,
+    pub loc_lat: String,
+    pub loc_lon: String,
+    pub loc_elev_m: String,
+    pub make: String,
+    pub model: String,
+    pub firmware_version: String,
+    pub samplerate_hz: String,
+    pub te_factor: String,
+    pub temp_c: String,
+    pub humidity_pct: String,
+    pub note: String,
+    pub extra_fields: BTreeMap<String, String>,
+}
+
+impl GuanoEditorDraft {
+    pub fn from_guano(guano: Option<&GuanoMetadata>, sr_hz: u32, _dur_s: f64) -> Self {
+        let g = guano.cloned().unwrap_or_else(GuanoMetadata::new_v1);
+        Self {
+            species_auto_id: g.species_auto_id.join(", "),
+            species_manual_id: g.species_manual_id.join(", "),
+            timestamp: g.timestamp.unwrap_or_default(),
+            loc_lat: g.loc_position.map(|(lat, _)| format!("{lat:.6}")).unwrap_or_default(),
+            loc_lon: g.loc_position.map(|(_, lon)| format!("{lon:.6}")).unwrap_or_default(),
+            loc_elev_m: g.loc_elevation_m.map(|v| format!("{v:.1}")).unwrap_or_default(),
+            make: g.make.unwrap_or_default(),
+            model: g.model.unwrap_or_default(),
+            firmware_version: g.firmware_version.unwrap_or_default(),
+            samplerate_hz: g.samplerate_hz.unwrap_or(sr_hz).to_string(),
+            te_factor: g.time_expansion.unwrap_or(1).to_string(),
+            temp_c: g.temperature_ext_c.map(|v| format!("{v:.1}")).unwrap_or_default(),
+            humidity_pct: g.humidity_pct.map(|v| format!("{v:.1}")).unwrap_or_default(),
+            note: g.note.unwrap_or_default(),
+            extra_fields: g.extra_fields,
+        }
+    }
+
+    pub fn to_guano(&self, recording_dur_s: f64) -> Result<GuanoMetadata, String> {
+        let sr_trim = self.samplerate_hz.trim();
+        let samplerate_hz = if sr_trim.is_empty() {
+            None
+        } else {
+            let sr = sr_trim
+                .parse::<u32>()
+                .map_err(|_| format!("Invalid Samplerate '{sr_trim}' (expected positive integer Hz)"))?;
+            if sr == 0 {
+                return Err("Samplerate must be > 0 Hz".to_string());
+            }
+            Some(sr)
+        };
+
+        let te_trim = self.te_factor.trim();
+        let time_expansion = if te_trim.is_empty() {
+            None
+        } else {
+            let te = te_trim
+                .parse::<u32>()
+                .map_err(|_| format!("Invalid TE factor '{te_trim}' (expected integer >= 1)"))?;
+            if te == 0 {
+                return Err("TE factor must be >= 1".to_string());
+            }
+            Some(te)
+        };
+
+        let lat_trim = self.loc_lat.trim();
+        let lon_trim = self.loc_lon.trim();
+        let loc_position = match (lat_trim.is_empty(), lon_trim.is_empty()) {
+            (true, true) => None,
+            (false, false) => {
+                let lat = lat_trim
+                    .parse::<f64>()
+                    .map_err(|_| format!("Invalid Latitude '{lat_trim}'"))?;
+                let lon = lon_trim
+                    .parse::<f64>()
+                    .map_err(|_| format!("Invalid Longitude '{lon_trim}'"))?;
+                if !(-90.0..=90.0).contains(&lat) {
+                    return Err(format!("Latitude {lat} out of range [-90, 90]"));
+                }
+                if !(-180.0..=180.0).contains(&lon) {
+                    return Err(format!("Longitude {lon} out of range [-180, 180]"));
+                }
+                Some((lat, lon))
+            }
+            _ => {
+                return Err("Specify both Latitude and Longitude, or leave both blank".to_string());
+            }
+        };
+
+        let loc_elevation_m = parse_optional_f64(&self.loc_elev_m, "Elevation (m)")?;
+        let temperature_ext_c = parse_optional_f64(&self.temp_c, "Temperature (C)")?;
+        let humidity_pct = parse_optional_f64(&self.humidity_pct, "Humidity (%)")?;
+        if let Some(rh) = humidity_pct {
+            if !(0.0..=100.0).contains(&rh) {
+                return Err(format!("Humidity {rh:.1}% out of range [0, 100]"));
+            }
+        }
+
+        let parse_id_list = |raw: &str| -> Vec<String> {
+            raw.split([',', ';'])
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        };
+        let opt_str = |raw: &str| -> Option<String> {
+            let t = raw.trim();
+            if t.is_empty() {
+                None
+            } else {
+                Some(t.to_string())
+            }
+        };
+
+        Ok(GuanoMetadata {
+            version: "1.0".to_string(),
+            timestamp: opt_str(&self.timestamp),
+            samplerate_hz,
+            length_s: Some(recording_dur_s),
+            make: opt_str(&self.make),
+            model: opt_str(&self.model),
+            firmware_version: opt_str(&self.firmware_version),
+            loc_position,
+            loc_elevation_m,
+            temperature_ext_c,
+            humidity_pct,
+            time_expansion,
+            species_auto_id: parse_id_list(&self.species_auto_id),
+            species_manual_id: parse_id_list(&self.species_manual_id),
+            note: opt_str(&self.note),
+            extra_fields: self.extra_fields.clone(),
+        })
+    }
+}
+
+fn parse_optional_f64(raw: &str, label: &str) -> Result<Option<f64>, String> {
+    let t = raw.trim();
+    if t.is_empty() {
+        Ok(None)
+    } else {
+        let v = t
+            .parse::<f64>()
+            .map_err(|_| format!("Invalid {label} '{t}'"))?;
+        if !v.is_finite() {
+            return Err(format!("{label} must be finite"));
+        }
+        Ok(Some(v))
+    }
 }
 
 const CLUSTER_COLORS: [Color32; 6] = [
@@ -192,23 +348,34 @@ pub struct SonoWingApp {
     pub selected_call_idx: Option<usize>,
 
     // Ultrasonic Audition & Export Controls
+    pub audio_player: UltrasonicAudioPlayer,
+    pub audition_mode: AuditionMode,
     pub heterodyne_carrier_khz: f64,
     pub freq_div_ratio: u8,
     pub file_path_input: String,
     pub export_dir_input: String,
     pub slot_name_input: String,
     pub status_banner: String,
+    pub current_source_path: Option<PathBuf>,
+    pub current_preset: Option<BuiltinPreset>,
+    pub guano_draft: GuanoEditorDraft,
+    pub guano_error: Option<String>,
 
     // Modals & SQLite state
     pub show_reference_modal: bool,
     pub show_sessions_modal: bool,
+    pub show_about_modal: bool,
     pub recent_sessions: Vec<SavedSessionSummary>,
     db_path: PathBuf,
     spec_texture: Option<TextureHandle>,
-    spec_dirty: bool,
+    pub spec_dirty: bool,
 }
 
 impl SonoWingApp {
+    pub fn has_spec_texture(&self) -> bool {
+        self.spec_texture.is_some()
+    }
+
     pub fn new(
         cc: &eframe::CreationContext<'_>,
         initial_file: Option<PathBuf>,
@@ -226,10 +393,23 @@ impl SonoWingApp {
     ) -> Self {
         configure_dark_scientific_theme(ctx);
 
+        let mut current_source_path: Option<PathBuf> = None;
+        let mut current_preset: Option<BuiltinPreset> = None;
+        let mut init_err: Option<String> = None;
         let init_rec = if let Some(ref p) = initial_file {
-            load_any_bioacoustic_path(p)
-                .unwrap_or_else(|_| synthesize_preset(BuiltinPreset::B1MyluFeedingBuzz))
+            match load_any_bioacoustic_path(p) {
+                Ok(rec) => {
+                    current_source_path = Some(p.clone());
+                    rec
+                }
+                Err(e) => {
+                    init_err = Some(format!("Failed to load '{}': {e}", p.display()));
+                    current_preset = Some(BuiltinPreset::B1MyluFeedingBuzz);
+                    synthesize_preset(BuiltinPreset::B1MyluFeedingBuzz)
+                }
+            }
         } else {
+            current_preset = Some(BuiltinPreset::B1MyluFeedingBuzz);
             synthesize_preset(BuiltinPreset::B1MyluFeedingBuzz)
         };
 
@@ -238,6 +418,11 @@ impl SonoWingApp {
         let cluster_cfg = ManifoldClusterConfig::default();
         let dur_s = init_rec.duration_s().max(0.05);
         let nyq_khz = (init_rec.nyquist_hz() * 0.001).max(4.0);
+        let init_guano_draft = GuanoEditorDraft::from_guano(
+            init_rec.guano.as_ref(),
+            init_rec.sample_rate_hz,
+            dur_s,
+        );
 
         let mut app = Self {
             stage: if skip_hub || initial_file.is_some() {
@@ -304,6 +489,8 @@ impl SonoWingApp {
             show_tkeo_overlay: true,
             cursor_frame: 0,
             selected_call_idx: None,
+            audio_player: UltrasonicAudioPlayer::new(),
+            audition_mode: AuditionMode::TimeExpansion10x,
             heterodyne_carrier_khz: 41.0,
             freq_div_ratio: 10,
             file_path_input: initial_file
@@ -312,25 +499,47 @@ impl SonoWingApp {
                 .unwrap_or_default(),
             export_dir_input: "exports".to_string(),
             slot_name_input: "Willamette Survey v1.1".to_string(),
-            status_banner: "SonoWing v1.1.0 Ready — MFCC/UMAP clustering, harmonic stack tracking, and live microphone capture active.".to_string(),
+            status_banner: init_err.unwrap_or_else(|| {
+                "SonoWing v1.1.0 Ready — MFCC/UMAP clustering, harmonic stack tracking, and live microphone capture active.".to_string()
+            }),
+            current_source_path,
+            current_preset,
+            guano_draft: init_guano_draft,
+            guano_error: None,
             show_reference_modal: false,
             show_sessions_modal: false,
+            show_about_modal: false,
             recent_sessions: Vec::new(),
             db_path,
             spec_texture: None,
             spec_dirty: true,
         };
         app.recompute_full_pipeline(true);
+        app.sync_guano_draft();
         app.refresh_sessions_list();
         app
     }
 
+    pub fn sync_guano_draft(&mut self) {
+        self.guano_draft = GuanoEditorDraft::from_guano(
+            self.raw_recording.guano.as_ref(),
+            self.raw_recording.sample_rate_hz,
+            self.raw_recording.duration_s(),
+        );
+        self.guano_error = None;
+    }
+
     pub fn load_preset(&mut self, preset: BuiltinPreset) {
         self.live_mic.stop();
+        self.audio_player.stop();
         self.active_preset = preset;
+        self.current_preset = Some(preset);
+        self.current_source_path = None;
+        self.file_path_input.clear();
         self.raw_recording = synthesize_preset(preset);
         self.apply_bandpass = false;
         self.recompute_full_pipeline(true);
+        self.sync_guano_draft();
         self.status_banner = format!(
             "Loaded preset {} — {} ({:.2} s @ {:.1} kHz, {} calls, K*={} clusters)",
             preset.code(),
@@ -344,11 +553,25 @@ impl SonoWingApp {
 
     pub fn load_external_path(&mut self, path: &Path) {
         self.live_mic.stop();
+        self.audio_player.stop();
+        let lower_name = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if lower_name.ends_with(".sonoworkset.json") || lower_name.ends_with(".json") {
+            self.import_workset_from_path(path);
+            return;
+        }
         match load_any_bioacoustic_path(path) {
             Ok(rec) => {
                 self.raw_recording = rec;
+                self.current_source_path = Some(path.to_path_buf());
+                self.current_preset = None;
+                self.file_path_input = path.display().to_string();
                 self.apply_bandpass = false;
                 self.recompute_full_pipeline(true);
+                self.sync_guano_draft();
                 self.stage = AppStage::Workstation;
                 self.status_banner = format!(
                     "Loaded '{}' ({:.3} s @ {} Hz, {} calls, K*={} clusters)",
@@ -366,6 +589,7 @@ impl SonoWingApp {
     }
 
     pub fn recompute_full_pipeline(&mut self, reset_viewport: bool) {
+        self.audio_player.stop();
         let sr = self.raw_recording.sample_rate_hz;
         let nyq_khz = (self.raw_recording.nyquist_hz() * 0.001).max(1.0);
 
@@ -459,14 +683,71 @@ impl SonoWingApp {
             if let Some(live_rec) = self.live_mic.freeze_to_recording() {
                 let prev_sr = self.raw_recording.sample_rate_hz;
                 self.raw_recording = live_rec;
+                self.current_source_path = None;
+                self.current_preset = None;
                 let sr_changed = prev_sr != self.raw_recording.sample_rate_hz;
                 self.recompute_full_pipeline(sr_changed);
+                self.sync_guano_draft();
                 self.view_start_s = 0.0;
                 self.view_end_s = self.raw_recording.duration_s().max(0.1);
                 self.spec_dirty = true;
             }
         }
         ctx.request_repaint_after(Duration::from_millis(60));
+    }
+
+    fn poll_audio_playback(&mut self, ctx: &egui::Context) {
+        if !self.audio_player.is_playing() {
+            return;
+        }
+        if let Some(err) = self.audio_player.take_error() {
+            self.audio_player.stop();
+            self.status_banner = format!("Audio playback stream error: {err}");
+            return;
+        }
+        if self.audio_player.is_finished() {
+            self.audio_player.stop();
+            self.status_banner = "Audible playback finished.".to_string();
+            return;
+        }
+        if !self.audio_player.is_paused() {
+            if let Some(t_s) = self.audio_player.current_source_time_s() {
+                self.cursor_frame = self.time_to_frame(t_s);
+            }
+            ctx.request_repaint_after(Duration::from_millis(33));
+        }
+    }
+
+    fn start_audio_playback(&mut self, mode: AuditionMode) {
+        self.audition_mode = mode;
+        let samples = if self.apply_bandpass && !self.filtered_samples.is_empty() {
+            self.filtered_samples.clone()
+        } else {
+            self.raw_recording.samples.clone()
+        };
+        let playback_rec = BioAcousticRecording {
+            source_name: self.raw_recording.source_name.clone(),
+            sample_rate_hz: self.raw_recording.sample_rate_hz,
+            raw_header_rate_hz: self.raw_recording.raw_header_rate_hz,
+            channels: 1,
+            encoding: self.raw_recording.encoding,
+            samples,
+            guano: self.raw_recording.guano.clone(),
+            riff_info: self.raw_recording.riff_info.clone(),
+        };
+        let dur_s = playback_rec.duration_s().max(1e-6);
+        let cur_t = self.spectrogram.frame_time_s(self.cursor_frame);
+        let mut start_fraction = (cur_t / dur_s).clamp(0.0, 0.99);
+        if start_fraction >= 0.96 {
+            start_fraction = 0.0;
+        }
+        match self
+            .audio_player
+            .play_recording(&playback_rec, mode, start_fraction)
+        {
+            Ok(msg) => self.status_banner = msg,
+            Err(err) => self.status_banner = format!("Audio playback unavailable: {err}"),
+        }
     }
 
     fn time_to_frame(&self, t_s: f64) -> usize {
@@ -522,11 +803,18 @@ impl SonoWingApp {
         self.spec_dirty = false;
     }
 
-    fn quick_save_sqlite(&mut self) {
+    pub fn quick_save_sqlite(&mut self) {
+        let src_path_str = self
+            .current_source_path
+            .as_ref()
+            .map(|p| p.display().to_string());
+        let preset_code = self.current_preset.map(|p| p.code());
         match SonoWingRepository::open(&self.db_path) {
-            Ok(repo) => match repo.save_session(
+            Ok(repo) => match repo.save_session_with_source(
                 &self.slot_name_input,
                 &self.raw_recording.source_name,
+                src_path_str.as_deref(),
+                preset_code,
                 self.raw_recording.sample_rate_hz,
                 self.raw_recording.duration_s(),
                 self.raw_recording.guano.as_ref(),
@@ -551,30 +839,238 @@ impl SonoWingApp {
     }
 
     fn refresh_sessions_list(&mut self) {
-        if let Ok(repo) = SonoWingRepository::open(&self.db_path) {
-            if let Ok(list) = repo.list_recent_sessions(25) {
-                self.recent_sessions = list;
-            }
+        match SonoWingRepository::open(&self.db_path) {
+            Ok(repo) => match repo.list_recent_sessions(25) {
+                Ok(list) => self.recent_sessions = list,
+                Err(e) => self.status_banner = format!("SQLite session list error: {e}"),
+            },
+            Err(e) => self.status_banner = format!("SQLite open error: {e}"),
         }
     }
 
-    fn load_sqlite_session(&mut self, session_id: i64) {
-        if let Ok(repo) = SonoWingRepository::open(&self.db_path) {
-            match repo.load_session_payload(session_id) {
+    fn resolve_recording_for_payload(
+        &self,
+        payload: &WorksetPayload,
+        hint_dir: Option<&Path>,
+    ) -> (
+        BioAcousticRecording,
+        Option<PathBuf>,
+        Option<BuiltinPreset>,
+        Option<String>,
+    ) {
+        let mut last_err: Option<String> = None;
+
+        if let Some(sp) = &payload.source_path {
+            let p = PathBuf::from(sp);
+            if p.exists() {
+                match load_any_bioacoustic_path(&p) {
+                    Ok(rec) => return (rec, Some(p), None, None),
+                    Err(e) => last_err = Some(e),
+                }
+            } else {
+                last_err = Some(format!("File '{}' does not exist", p.display()));
+            }
+        }
+
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Some(dir) = hint_dir {
+            candidates.push(dir.join(&payload.source_name));
+        }
+        if !self.file_path_input.trim().is_empty() {
+            let fp = PathBuf::from(self.file_path_input.trim());
+            if fp.file_name().and_then(|s| s.to_str()) == Some(payload.source_name.as_str()) {
+                candidates.push(fp);
+            }
+        }
+        candidates.push(PathBuf::from(&payload.source_name));
+        candidates.push(PathBuf::from("samples").join(&payload.source_name));
+        if let Some(db_parent) = self.db_path.parent() {
+            if !db_parent.as_os_str().is_empty() {
+                candidates.push(db_parent.join(&payload.source_name));
+            }
+        }
+        for cand in candidates {
+            if cand.exists() {
+                match load_any_bioacoustic_path(&cand) {
+                    Ok(rec) => return (rec, Some(cand), None, None),
+                    Err(e) => last_err = Some(e),
+                }
+            }
+        }
+
+        if let Some(code) = &payload.preset_code {
+            if let Some(preset) = BuiltinPreset::from_code(code) {
+                return (synthesize_preset(preset), None, Some(preset), None);
+            }
+        }
+        for preset in BuiltinPreset::ALL {
+            let synth = synthesize_preset(preset);
+            if synth.source_name == payload.source_name {
+                return (synth, None, Some(preset), None);
+            }
+        }
+
+        if self.raw_recording.source_name == payload.source_name
+            && self.raw_recording.sample_rate_hz == payload.sample_rate_hz
+            && (self.raw_recording.duration_s() - payload.duration_s).abs() < 0.05
+            && !self.raw_recording.samples.is_empty()
+        {
+            return (
+                self.raw_recording.clone(),
+                self.current_source_path.clone(),
+                self.current_preset,
+                None,
+            );
+        }
+
+        let sr = payload.sample_rate_hz.max(8_000);
+        let n_samp = ((payload.duration_s.clamp(0.05, 30.0)) * sr as f64)
+            .round()
+            .max(512.0) as usize;
+        let placeholder = BioAcousticRecording {
+            source_name: payload.source_name.clone(),
+            sample_rate_hz: sr,
+            raw_header_rate_hz: sr,
+            channels: 1,
+            encoding: crate::wav_guano::SampleEncoding::IeeeF32,
+            samples: vec![0.0; n_samp],
+            guano: payload.guano.clone(),
+            riff_info: BTreeMap::new(),
+        };
+        let reason = last_err.unwrap_or_else(|| "source WAV/ZC file not found on disk".to_string());
+        (
+            placeholder,
+            None,
+            None,
+            Some(format!(
+                "Source audio '{}' could not be reloaded ({reason}); displaying saved calls on silent placeholder.",
+                payload.source_name
+            )),
+        )
+    }
+
+    pub fn apply_workset_payload(
+        &mut self,
+        payload: WorksetPayload,
+        hint_dir: Option<&Path>,
+    ) -> Option<String> {
+        self.live_mic.stop();
+        self.audio_player.stop();
+
+        let (mut rec, resolved_path, resolved_preset, warning) =
+            self.resolve_recording_for_payload(&payload, hint_dir);
+        if let Some(g) = payload.guano {
+            rec.guano = Some(g);
+        }
+
+        self.raw_recording = rec;
+        self.current_source_path = resolved_path.clone();
+        self.current_preset = resolved_preset;
+        if let Some(p) = resolved_path {
+            self.file_path_input = p.display().to_string();
+        } else {
+            self.file_path_input.clear();
+        }
+        if let Some(p) = resolved_preset {
+            self.active_preset = p;
+        }
+
+        // Preserve saved call annotations (including manual vetting), harmonics, clusters, indices
+        self.detected_calls = payload.detected_calls;
+        self.harmonic_profiles = payload.harmonic_profiles;
+        self.cluster_report = payload.cluster_report;
+        self.soundscape_indices = payload.soundscape_indices;
+
+        let sr = self.raw_recording.sample_rate_hz;
+        let nyq_khz = (self.raw_recording.nyquist_hz() * 0.001).max(1.0);
+        self.apply_bandpass = false;
+        self.filtered_samples = self.raw_recording.samples.clone();
+        self.tkeo_trace = compute_tkeo(&self.filtered_samples);
+
+        if sr >= 160_000 {
+            self.stft_cfg.fft_size = 512;
+            self.stft_cfg.hop_size = 64;
+            self.heterodyne_carrier_khz = 41.0;
+        } else {
+            self.stft_cfg.fft_size = 1024;
+            self.stft_cfg.hop_size = 256;
+            self.heterodyne_carrier_khz = (nyq_khz * 0.5).clamp(2.0, 20.0);
+        }
+        self.bandpass_low_khz = if sr >= 160_000 { 15.0 } else { 1.2 };
+        self.bandpass_high_khz = (nyq_khz * 0.94).max(self.bandpass_low_khz + 1.0);
+
+        self.spectrogram = compute_stft(&self.filtered_samples, sr, self.stft_cfg);
+        let min_zc_hz = if sr >= 120_000 { 14_000.0 } else { 600.0 };
+        self.zc_dots = extract_zero_crossing_dots(
+            &self.filtered_samples,
+            sr,
+            self.zc_division_ratio,
+            0.055,
+            min_zc_hz,
+            self.raw_recording.nyquist_hz() * 0.96,
+        );
+
+        self.view_start_s = 0.0;
+        self.view_end_s = self.raw_recording.duration_s().max(0.05);
+        self.freq_min_khz = 0.0;
+        self.freq_max_khz = nyq_khz;
+        self.selected_call_idx = if self.detected_calls.is_empty() {
+            None
+        } else {
+            Some(0)
+        };
+        if let Some(first) = self.detected_calls.first() {
+            let mid_t = 0.5 * (first.begin_time_s + first.end_time_s);
+            self.cursor_frame = self.time_to_frame(mid_t);
+        } else {
+            self.cursor_frame = self.spectrogram.num_frames / 2;
+        }
+
+        self.spec_texture = None;
+        self.spec_dirty = true;
+        self.sync_guano_draft();
+        self.stage = AppStage::Workstation;
+        warning
+    }
+
+    pub fn load_sqlite_session(&mut self, session_id: i64) {
+        match SonoWingRepository::open(&self.db_path) {
+            Ok(repo) => match repo.load_session_payload(session_id) {
                 Ok(payload) => {
-                    self.detected_calls = payload.detected_calls;
-                    self.harmonic_profiles = payload.harmonic_profiles;
-                    self.cluster_report = payload.cluster_report;
-                    self.soundscape_indices = payload.soundscape_indices;
-                    if let Some(g) = payload.guano {
-                        self.raw_recording.guano = Some(g);
+                    let src = payload.source_name.clone();
+                    let n_calls = payload.detected_calls.len();
+                    if let Some(warn) = self.apply_workset_payload(payload, None) {
+                        self.status_banner =
+                            format!("Restored session #{session_id} ('{src}', {n_calls} calls) — {warn}");
+                    } else {
+                        self.status_banner = format!(
+                            "Restored v1.1.0 session #{session_id} ('{src}', {n_calls} calls, spectrogram rebuilt)"
+                        );
                     }
-                    self.status_banner = format!(
-                        "Restored v1.1.0 session #{session_id} ('{}')",
-                        payload.source_name
-                    );
                 }
                 Err(e) => self.status_banner = format!("Session load failed: {e}"),
+            },
+            Err(e) => self.status_banner = format!("SQLite open error: {e}"),
+        }
+    }
+
+    pub fn import_workset_from_path(&mut self, path: &Path) {
+        match SignedWorksetEnvelope::load_verified(path) {
+            Ok(env) => {
+                let src = env.payload.source_name.clone();
+                let n_calls = env.payload.detected_calls.len();
+                if let Some(warn) = self.apply_workset_payload(env.payload, path.parent()) {
+                    self.status_banner =
+                        format!("Imported verified workset '{src}' ({n_calls} calls) — {warn}");
+                } else {
+                    self.status_banner = format!(
+                        "Imported SHA-256 verified workset '{src}' ({n_calls} calls) from '{}'",
+                        path.display()
+                    );
+                }
+            }
+            Err(e) => {
+                self.status_banner = format!("Workset import error: {e}");
             }
         }
     }
@@ -583,6 +1079,7 @@ impl SonoWingApp {
 impl SonoWingApp {
     pub fn ui_step(&mut self, ctx: &egui::Context) {
         self.poll_live_microphone(ctx);
+        self.poll_audio_playback(ctx);
 
         let dropped: Vec<PathBuf> = ctx.input(|i| {
             i.raw
@@ -613,6 +1110,7 @@ impl SonoWingApp {
             if self.spec_dirty || self.spec_texture.is_none() {
                 self.rebuild_spectrogram_texture(ctx);
             }
+            self.render_status_footer(ctx);
             self.render_left_dsp_panel(ctx);
             self.render_right_inspector_panel(ctx);
             self.render_bottom_dock(ctx);
@@ -624,6 +1122,9 @@ impl SonoWingApp {
         }
         if self.show_sessions_modal {
             self.render_sessions_modal(ctx);
+        }
+        if self.show_about_modal {
+            self.render_about_modal(ctx);
         }
     }
 }
@@ -723,9 +1224,7 @@ pub fn render_headless_screenshot(out_path: &Path, view: u8) -> Result<(), Strin
     let tab_id = egui::Id::new("sonowing_bottom_tab_v11");
     match view {
         2 => {
-            app.active_preset = BuiltinPreset::A4VathHarmonicStack;
-            app.raw_recording = synthesize_preset(BuiltinPreset::A4VathHarmonicStack);
-            app.recompute_full_pipeline(true);
+            app.load_preset(BuiltinPreset::A4VathHarmonicStack);
             app.show_harmonics_overlay = true;
             app.show_call_boxes = true;
             app.selected_call_idx = if app.detected_calls.is_empty() { None } else { Some(0) };
@@ -853,6 +1352,8 @@ pub fn render_headless_screenshot(out_path: &Path, view: u8) -> Result<(), Strin
     let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), WIDTH, HEIGHT);
     encoder.set_color(png::ColorType::Rgba);
     encoder.set_depth(png::BitDepth::Eight);
+    encoder.set_compression(png::Compression::High);
+    encoder.set_filter(png::Filter::Adaptive);
     let mut writer = encoder
         .write_header()
         .map_err(|e| format!("PNG header error: {e}"))?;
@@ -885,6 +1386,30 @@ impl SonoWingApp {
                         self.stage = AppStage::StartupHub;
                         ui.close_menu();
                     }
+                    if ui.button("Open WAV / ZC File...").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("Bioacoustic Audio", &["wav", "WAV", "zc", "ZCF", "zcf"])
+                            .pick_file()
+                        {
+                            self.load_external_path(&path);
+                        }
+                        ui.close_menu();
+                    }
+                    if ui.button("Import .sonoworkset.json...").clicked() {
+                        if let Some(path) = rfd::FileDialog::new()
+                            .add_filter("SonoWing Workset", &["json"])
+                            .pick_file()
+                        {
+                            self.import_workset_from_path(&path);
+                        }
+                        ui.close_menu();
+                    }
+                    if ui.button("Edit GUANO v1.0 Metadata...").clicked() {
+                        let tab_id = egui::Id::new("sonowing_bottom_tab_v11");
+                        ctx.data_mut(|d| d.insert_temp(tab_id, BottomDockTab::GuanoMetadata));
+                        ui.close_menu();
+                    }
+                    ui.separator();
                     if ui.button("Save Session to SQLite WAL (F5)").clicked() {
                         self.quick_save_sqlite();
                         ui.close_menu();
@@ -941,7 +1466,10 @@ impl SonoWingApp {
                         if let Some(rec) = self.live_mic.freeze_to_recording() {
                             self.live_mic.stop();
                             self.raw_recording = rec;
+                            self.current_source_path = None;
+                            self.current_preset = None;
                             self.recompute_full_pipeline(true);
+                            self.sync_guano_draft();
                             self.status_banner =
                                 "Froze live microphone buffer into static analysis workspace."
                                     .to_string();
@@ -977,13 +1505,20 @@ impl SonoWingApp {
                         self.show_reference_modal = true;
                         ui.close_menu();
                     }
+                    if ui.button("About SonoWing & CRV Science Network").clicked() {
+                        self.show_about_modal = true;
+                        ui.close_menu();
+                    }
                 });
 
                 if self.live_mic.is_capturing() && ui.button("Freeze Live Mic").clicked() {
                     if let Some(rec) = self.live_mic.freeze_to_recording() {
                         self.live_mic.stop();
                         self.raw_recording = rec;
+                        self.current_source_path = None;
+                        self.current_preset = None;
                         self.recompute_full_pipeline(true);
+                        self.sync_guano_draft();
                         self.status_banner = "Froze live microphone spectrogram buffer.".to_string();
                     }
                 }
@@ -1042,7 +1577,7 @@ impl SonoWingApp {
                                 // 1. Top Hero Masthead
                                 egui::Frame::group(ui.style())
                                     .fill(Color32::from_rgb(19, 27, 40))
-                                    .stroke(Stroke::new(1.0, Color32::from_rgb(46, 70, 96)))
+                                    .stroke(Stroke::new(1.0_f32, Color32::from_rgb(46, 70, 96)))
                                     .corner_radius(CornerRadius::same(8))
                                     .inner_margin(egui::Margin::same(16))
                                     .show(ui, |hero| {
@@ -1107,7 +1642,7 @@ impl SonoWingApp {
                                         col.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
                                         egui::Frame::group(col.style())
                                             .fill(Color32::from_rgb(20, 26, 36))
-                                            .stroke(Stroke::new(1.0, Color32::from_rgb(44, 58, 80)))
+                                            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(44, 58, 80)))
                                             .corner_radius(CornerRadius::same(7))
                                             .inner_margin(egui::Margin::same(12))
                                             .show(col, |card| {
@@ -1211,7 +1746,7 @@ impl SonoWingApp {
                                         col.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
                                         egui::Frame::group(col.style())
                                             .fill(Color32::from_rgb(20, 26, 36))
-                                            .stroke(Stroke::new(1.0, Color32::from_rgb(44, 58, 80)))
+                                            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(44, 58, 80)))
                                             .corner_radius(CornerRadius::same(7))
                                             .inner_margin(egui::Margin::same(12))
                                             .show(col, |card| {
@@ -1295,7 +1830,7 @@ impl SonoWingApp {
                                         col.style_mut().wrap_mode = Some(egui::TextWrapMode::Wrap);
                                         egui::Frame::group(col.style())
                                             .fill(Color32::from_rgb(20, 26, 36))
-                                            .stroke(Stroke::new(1.0, Color32::from_rgb(44, 58, 80)))
+                                            .stroke(Stroke::new(1.0_f32, Color32::from_rgb(44, 58, 80)))
                                             .corner_radius(CornerRadius::same(7))
                                             .inner_margin(egui::Margin::same(12))
                                             .show(col, |card| {
@@ -1339,6 +1874,21 @@ impl SonoWingApp {
                                                 {
                                                     self.refresh_sessions_list();
                                                     self.show_sessions_modal = true;
+                                                }
+                                                card.add_space(4.0);
+                                                if card
+                                                    .add_sized(
+                                                        [cw, 26.0],
+                                                        egui::Button::new("Import .sonoworkset.json..."),
+                                                    )
+                                                    .clicked()
+                                                {
+                                                    if let Some(path) = rfd::FileDialog::new()
+                                                        .add_filter("SonoWing Workset", &["json"])
+                                                        .pick_file()
+                                                    {
+                                                        self.import_workset_from_path(&path);
+                                                    }
                                                 }
                                                 card.add_space(4.0);
                                                 card.label(
@@ -1415,7 +1965,7 @@ impl SonoWingApp {
                                                 egui::Frame::group(col_ui.style())
                                                     .fill(Color32::from_rgb(20, 27, 38))
                                                     .stroke(Stroke::new(
-                                                        1.0,
+                                                        1.0_f32,
                                                         Color32::from_rgb(44, 58, 80),
                                                     ))
                                                     .corner_radius(CornerRadius::same(7))
@@ -1535,11 +2085,32 @@ impl SonoWingApp {
                                 }
 
                                 ui.add_space(6.0);
-                                ui.label(
-                                    egui::RichText::new(&self.status_banner)
-                                        .size(12.0)
-                                        .color(Color32::from_rgb(172, 196, 222)),
-                                );
+                                ui.horizontal_wrapped(|foot| {
+                                    foot.label(
+                                        egui::RichText::new(&self.status_banner)
+                                            .size(12.0)
+                                            .color(Color32::from_rgb(172, 196, 222)),
+                                    );
+                                    foot.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |rhs| {
+                                            if rhs.button("About SonoWing").clicked() {
+                                                self.show_about_modal = true;
+                                            }
+                                            rhs.hyperlink_to(
+                                                "crvscience.com/apps",
+                                                "https://crvscience.com/apps",
+                                            );
+                                            rhs.label(
+                                                egui::RichText::new(
+                                                    "Copyright CRV Science Network (GPL-3.0-or-later)",
+                                                )
+                                                .size(11.5)
+                                                .color(Color32::from_rgb(154, 176, 204)),
+                                            );
+                                        },
+                                    );
+                                });
                             });
                         });
                     });
@@ -1580,7 +2151,10 @@ impl SonoWingApp {
                             if let Some(rec) = self.live_mic.freeze_to_recording() {
                                 self.live_mic.stop();
                                 self.raw_recording = rec;
+                                self.current_source_path = None;
+                                self.current_preset = None;
                                 self.recompute_full_pipeline(true);
+                                self.sync_guano_draft();
                             }
                         }
                     });
@@ -1588,9 +2162,18 @@ impl SonoWingApp {
                     ui.horizontal(|ui| {
                         ui.add(
                             egui::TextEdit::singleline(&mut self.file_path_input)
-                                .desired_width(190.0)
+                                .desired_width(142.0)
                                 .hint_text("WAV or .zc file path"),
                         );
+                        if ui.button("Browse...").clicked() {
+                            if let Some(path) = rfd::FileDialog::new()
+                                .add_filter("Bioacoustic Audio", &["wav", "WAV", "zc", "ZCF", "zcf"])
+                                .pick_file()
+                            {
+                                self.file_path_input = path.display().to_string();
+                                self.load_external_path(&path);
+                            }
+                        }
                         if ui.button("Load").clicked() && !self.file_path_input.trim().is_empty() {
                             let p = PathBuf::from(self.file_path_input.trim());
                             self.load_external_path(&p);
@@ -1977,6 +2560,26 @@ impl SonoWingApp {
             });
     }
 
+    fn render_status_footer(&mut self, ctx: &egui::Context) {
+        egui::TopBottomPanel::bottom("sonowing_status_footer")
+            .exact_height(26.0)
+            .show(ctx, |ui| {
+                ui.horizontal(|ui| {
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |rhs| {
+                        if rhs.small_button("About").clicked() {
+                            self.show_about_modal = true;
+                        }
+                        rhs.separator();
+                        rhs.small("Copyright CRV Science Network");
+                        rhs.separator();
+                        rhs.with_layout(egui::Layout::left_to_right(egui::Align::Center), |lhs| {
+                            lhs.add(egui::Label::new(egui::RichText::new(&self.status_banner).small()).truncate());
+                        });
+                    });
+                });
+            });
+    }
+
     fn render_bottom_dock(&mut self, ctx: &egui::Context) {
         let tab_id = egui::Id::new("sonowing_bottom_tab_v11");
         let mut active_tab = ctx
@@ -1987,7 +2590,7 @@ impl SonoWingApp {
             .resizable(true)
             .default_height(235.0)
             .show(ctx, |ui| {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     ui.selectable_value(
                         &mut active_tab,
                         BottomDockTab::CallsTable,
@@ -2013,11 +2616,14 @@ impl SonoWingApp {
                     );
                     ui.selectable_value(
                         &mut active_tab,
+                        BottomDockTab::GuanoMetadata,
+                        "GUANO v1.0",
+                    );
+                    ui.selectable_value(
+                        &mut active_tab,
                         BottomDockTab::AuditionAndExport,
                         "Auditioning & Exports",
                     );
-                    ui.separator();
-                    ui.small(&self.status_banner);
                 });
                 ui.separator();
 
@@ -2026,6 +2632,7 @@ impl SonoWingApp {
                     BottomDockTab::MfccUmapClusters => self.render_mfcc_umap_tab(ui),
                     BottomDockTab::ZeroCrossingTrace => self.render_zc_trace_tab(ui),
                     BottomDockTab::SoundscapeIndices => self.render_soundscape_tab(ui),
+                    BottomDockTab::GuanoMetadata => self.render_guano_editor_tab(ui),
                     BottomDockTab::AuditionAndExport => self.render_audition_export_tab(ui),
                 }
             });
@@ -2182,7 +2789,7 @@ impl SonoWingApp {
             painter.rect_stroke(
                 scatter_rect,
                 CornerRadius::same(4),
-                Stroke::new(1.0, Color32::from_rgb(46, 58, 78)),
+                Stroke::new(1.0_f32, Color32::from_rgb(46, 58, 78)),
                 StrokeKind::Inside,
             );
 
@@ -2192,14 +2799,14 @@ impl SonoWingApp {
                     Pos2::new(scatter_rect.left(), scatter_rect.center().y),
                     Pos2::new(scatter_rect.right(), scatter_rect.center().y),
                 ],
-                Stroke::new(0.8, Color32::from_rgb(30, 40, 56)),
+                Stroke::new(0.8_f32, Color32::from_rgb(30, 40, 56)),
             );
             painter.line_segment(
                 [
                     Pos2::new(scatter_rect.center().x, scatter_rect.top()),
                     Pos2::new(scatter_rect.center().x, scatter_rect.bottom()),
                 ],
-                Stroke::new(0.8, Color32::from_rgb(30, 40, 56)),
+                Stroke::new(0.8_f32, Color32::from_rgb(30, 40, 56)),
             );
 
             let mut clicked_call: Option<usize> = None;
@@ -2212,7 +2819,7 @@ impl SonoWingApp {
                 let is_sel = self.selected_call_idx == Some(pt.call_index);
                 painter.circle_filled(pos, if is_sel { 6.0 } else { 4.2 }, col);
                 if is_sel {
-                    painter.circle_stroke(pos, 8.0, Stroke::new(1.6, Color32::WHITE));
+                    painter.circle_stroke(pos, 8.0, Stroke::new(1.6_f32, Color32::WHITE));
                 }
                 painter.text(
                     Pos2::new(pos.x + 6.0, pos.y - 6.0),
@@ -2287,7 +2894,7 @@ impl SonoWingApp {
         painter.rect_stroke(
             rect,
             CornerRadius::same(4),
-            Stroke::new(1.0, Color32::from_rgb(48, 60, 78)),
+            Stroke::new(1.0_f32, Color32::from_rgb(48, 60, 78)),
             StrokeKind::Inside,
         );
 
@@ -2375,19 +2982,261 @@ impl SonoWingApp {
         });
     }
 
+    fn render_guano_editor_tab(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|bar| {
+            bar.strong("GUANO v1.0 Embedded Metadata Editor");
+            if bar.button("Apply to Session").clicked() {
+                match self.guano_draft.to_guano(self.raw_recording.duration_s()) {
+                    Ok(g) => {
+                        self.raw_recording.guano = Some(g);
+                        self.guano_error = None;
+                        self.status_banner =
+                            "Applied edited GUANO v1.0 metadata to active session.".to_string();
+                    }
+                    Err(e) => {
+                        self.guano_error = Some(e.clone());
+                        self.status_banner = format!("GUANO validation error: {e}");
+                    }
+                }
+            }
+            if bar.button("Sync Manual IDs from Vetted Calls").clicked() {
+                let mut codes: Vec<String> = Vec::new();
+                for ev in &self.detected_calls {
+                    let code = ev.primary_code().to_string();
+                    if code != "UNID" && !codes.contains(&code) {
+                        codes.push(code);
+                    }
+                }
+                self.guano_draft.species_manual_id = codes.join(", ");
+                self.guano_error = None;
+                self.status_banner =
+                    "Synchronized GUANO Species Manual ID from active call detections.".to_string();
+            }
+            if bar.button("Save WAV with GUANO...").clicked() {
+                match self.guano_draft.to_guano(self.raw_recording.duration_s()) {
+                    Ok(g) => {
+                        self.raw_recording.guano = Some(g.clone());
+                        self.guano_error = None;
+                        let default_name = if self.raw_recording.source_name.ends_with(".wav") {
+                            self.raw_recording.source_name.clone()
+                        } else {
+                            format!("{}.wav", self.raw_recording.source_name)
+                        };
+                        if let Some(out_path) = rfd::FileDialog::new()
+                            .add_filter("WAV Audio", &["wav"])
+                            .set_file_name(&default_name)
+                            .save_file()
+                        {
+                            match write_wav_with_guano(
+                                &out_path,
+                                &self.raw_recording.samples,
+                                self.raw_recording.sample_rate_hz,
+                                Some(&g),
+                            ) {
+                                Ok(()) => {
+                                    self.current_source_path = Some(out_path.clone());
+                                    self.file_path_input = out_path.display().to_string();
+                                    let te_warn = if self.raw_recording.sample_rate_hz <= 50_000
+                                        && g.time_expansion.unwrap_or(1) > 1
+                                    {
+                                        " (Note: header <=50 kHz with TE>1 scales rate on reload)"
+                                    } else {
+                                        ""
+                                    };
+                                    self.status_banner = format!(
+                                        "Saved WAV with embedded GUANO v1.0 to '{}'{}",
+                                        out_path.display(),
+                                        te_warn
+                                    );
+                                }
+                                Err(e) => {
+                                    self.status_banner = format!("WAV save error: {e}");
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        self.guano_error = Some(e.clone());
+                        self.status_banner = format!("GUANO validation error: {e}");
+                    }
+                }
+            }
+            if bar.button("Save .sonoworkset.json...").clicked() {
+                match self.guano_draft.to_guano(self.raw_recording.duration_s()) {
+                    Ok(g) => {
+                        self.raw_recording.guano = Some(g);
+                        self.guano_error = None;
+                        let stem = self
+                            .raw_recording
+                            .source_name
+                            .rsplit_once('.')
+                            .map(|(s, _)| s)
+                            .unwrap_or(&self.raw_recording.source_name);
+                        let default_ws = format!("{stem}.sonoworkset.json");
+                        if let Some(out_path) = rfd::FileDialog::new()
+                            .add_filter("SonoWing Workset", &["sonoworkset.json", "json"])
+                            .set_file_name(&default_ws)
+                            .save_file()
+                        {
+                            let payload = self.build_current_workset_payload();
+                            match SignedWorksetEnvelope::build(payload)
+                                .and_then(|env| env.save_to_file(&out_path))
+                            {
+                                Ok(()) => {
+                                    self.status_banner = format!(
+                                        "Saved SHA-256 verified workset '{}'",
+                                        out_path.display()
+                                    );
+                                }
+                                Err(e) => {
+                                    self.status_banner = format!("Workset save error: {e}");
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        self.guano_error = Some(e.clone());
+                        self.status_banner = format!("GUANO validation error: {e}");
+                    }
+                }
+            }
+        });
+
+        if let Some(ref err) = self.guano_error {
+            ui.colored_label(Color32::from_rgb(255, 118, 136), format!("Validation Error: {err}"));
+        }
+
+        egui::ScrollArea::vertical().show(ui, |ui| {
+            ui.columns(2, |cols| {
+                egui::Grid::new("guano_editor_grid_left")
+                    .num_columns(2)
+                    .spacing([8.0, 4.0])
+                    .show(&mut cols[0], |ui| {
+                        ui.label("Species Auto ID:");
+                        ui.add(egui::TextEdit::singleline(&mut self.guano_draft.species_auto_id).desired_width(210.0));
+                        ui.end_row();
+
+                        ui.label("Species Manual ID:");
+                        ui.add(egui::TextEdit::singleline(&mut self.guano_draft.species_manual_id).desired_width(210.0));
+                        ui.end_row();
+
+                        ui.label("Timestamp (ISO-8601):");
+                        ui.add(egui::TextEdit::singleline(&mut self.guano_draft.timestamp).desired_width(210.0));
+                        ui.end_row();
+
+                        ui.label("Loc Lat / Lon (deg):");
+                        ui.horizontal(|ui| {
+                            ui.add(egui::TextEdit::singleline(&mut self.guano_draft.loc_lat).desired_width(98.0).hint_text("Lat"));
+                            ui.add(egui::TextEdit::singleline(&mut self.guano_draft.loc_lon).desired_width(98.0).hint_text("Lon"));
+                        });
+                        ui.end_row();
+
+                        ui.label("Elevation (m):");
+                        ui.add(egui::TextEdit::singleline(&mut self.guano_draft.loc_elev_m).desired_width(110.0));
+                        ui.end_row();
+
+                        ui.label("Make / Model:");
+                        ui.horizontal(|ui| {
+                            ui.add(egui::TextEdit::singleline(&mut self.guano_draft.make).desired_width(98.0).hint_text("Make"));
+                            ui.add(egui::TextEdit::singleline(&mut self.guano_draft.model).desired_width(98.0).hint_text("Model"));
+                        });
+                        ui.end_row();
+
+                        ui.label("Firmware Version:");
+                        ui.add(egui::TextEdit::singleline(&mut self.guano_draft.firmware_version).desired_width(210.0));
+                        ui.end_row();
+                    });
+
+                egui::Grid::new("guano_editor_grid_right")
+                    .num_columns(2)
+                    .spacing([8.0, 4.0])
+                    .show(&mut cols[1], |ui| {
+                        ui.label("Samplerate (Hz) / TE:");
+                        ui.horizontal(|ui| {
+                            ui.add(egui::TextEdit::singleline(&mut self.guano_draft.samplerate_hz).desired_width(98.0));
+                            ui.add(egui::TextEdit::singleline(&mut self.guano_draft.te_factor).desired_width(54.0).hint_text("TE"));
+                        });
+                        ui.end_row();
+
+                        ui.label("Temp (C) / Humidity (%):");
+                        ui.horizontal(|ui| {
+                            ui.add(egui::TextEdit::singleline(&mut self.guano_draft.temp_c).desired_width(98.0).hint_text("C"));
+                            ui.add(egui::TextEdit::singleline(&mut self.guano_draft.humidity_pct).desired_width(98.0).hint_text("RH%"));
+                        });
+                        ui.end_row();
+
+                        ui.label("Field Note:");
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.guano_draft.note)
+                                .desired_rows(2)
+                                .desired_width(240.0),
+                        );
+                        ui.end_row();
+
+                        ui.label("GUANO|Version Preview:");
+                        let preview = self
+                            .guano_draft
+                            .to_guano(self.raw_recording.duration_s())
+                            .map(|g| g.to_guano_text())
+                            .unwrap_or_else(|e| format!("(Validation error: {e})"));
+                        ui.add(
+                            egui::TextEdit::multiline(&mut preview.clone())
+                                .font(FontId::monospace(10.0))
+                                .desired_rows(3)
+                                .desired_width(240.0)
+                                .interactive(false),
+                        );
+                        ui.end_row();
+                    });
+            });
+        });
+    }
+
     fn render_audition_export_tab(&mut self, ui: &mut egui::Ui) {
         ui.columns(2, |cols| {
-            cols[0].strong("Ultrasonic-to-Audible WAV Synthesis (48 kHz Playable)");
+            cols[0].strong("Live Audible Playback (cpal) & WAV Synthesis (48 kHz)");
             cols[0].horizontal(|ui| {
                 ui.add(
                     egui::Slider::new(&mut self.heterodyne_carrier_khz, 12.0..=130.0)
-                        .text("Heterodyne Carrier (kHz)"),
+                        .text("Heterodyne (kHz)"),
                 );
                 ui.add(
-                    egui::Slider::new(&mut self.freq_div_ratio, 4..=20).text("Freq Div Ratio"),
+                    egui::Slider::new(&mut self.freq_div_ratio, 4..=20).text("Freq Div"),
                 );
             });
-            cols[0].horizontal(|ui| {
+            cols[0].horizontal_wrapped(|ui| {
+                if ui.button("Play 10x").clicked() {
+                    self.start_audio_playback(AuditionMode::TimeExpansion10x);
+                }
+                if ui.button("Play 20x").clicked() {
+                    self.start_audio_playback(AuditionMode::TimeExpansion20x);
+                }
+                if ui.button("Play Het").clicked() {
+                    self.start_audio_playback(AuditionMode::Heterodyne {
+                        carrier_khz: self.heterodyne_carrier_khz,
+                    });
+                }
+                if ui.button("Play FDiv").clicked() {
+                    self.start_audio_playback(AuditionMode::FrequencyDivision {
+                        ratio: self.freq_div_ratio,
+                    });
+                }
+                if self.audio_player.is_playing() {
+                    let pause_lbl = if self.audio_player.is_paused() {
+                        "Resume"
+                    } else {
+                        "Pause"
+                    };
+                    if ui.button(pause_lbl).clicked() {
+                        self.audio_player.pause_or_resume();
+                    }
+                    if ui.button("Stop").clicked() {
+                        self.audio_player.stop();
+                        self.status_banner = "Stopped audio playback.".to_string();
+                    }
+                }
+            });
+            cols[0].horizontal_wrapped(|ui| {
                 if ui.button("Export 10x Time-Expanded WAV").clicked() {
                     self.export_audible_wav(AuditionMode::TimeExpansion10x);
                 }
@@ -2403,14 +3252,19 @@ impl SonoWingApp {
                 }
             });
 
-            cols[1].strong("Raven Pro Selection Table, NABat CSV & SQLite WAL");
+            cols[1].strong("Raven Pro Selection Table, NABat CSV, Workset & SQLite WAL");
             cols[1].horizontal(|ui| {
                 ui.label("Output Folder:");
-                ui.add(egui::TextEdit::singleline(&mut self.export_dir_input).desired_width(150.0));
+                ui.add(egui::TextEdit::singleline(&mut self.export_dir_input).desired_width(130.0));
+                if ui.button("Browse Folder...").clicked() {
+                    if let Some(folder) = rfd::FileDialog::new().pick_folder() {
+                        self.export_dir_input = folder.display().to_string();
+                    }
+                }
                 ui.label("Slot:");
-                ui.add(egui::TextEdit::singleline(&mut self.slot_name_input).desired_width(140.0));
+                ui.add(egui::TextEdit::singleline(&mut self.slot_name_input).desired_width(120.0));
             });
-            cols[1].horizontal(|ui| {
+            cols[1].horizontal_wrapped(|ui| {
                 if ui.button("Export Raven .selections.txt").clicked() {
                     self.export_raven_and_csv(true, false);
                 }
@@ -2422,6 +3276,14 @@ impl SonoWingApp {
                 }
                 if ui.button("Export SHA-256 Workset").clicked() {
                     self.export_workset_envelope();
+                }
+                if ui.button("Import .sonoworkset.json...").clicked() {
+                    if let Some(path) = rfd::FileDialog::new()
+                        .add_filter("SonoWing Workset", &["json"])
+                        .pick_file()
+                    {
+                        self.import_workset_from_path(&path);
+                    }
                 }
                 if ui.button("Save SQLite (F5)").clicked() {
                     self.quick_save_sqlite();
@@ -2503,7 +3365,10 @@ impl SonoWingApp {
 
     fn export_zc_file(&mut self) {
         let dir = PathBuf::from(self.export_dir_input.trim());
-        let _ = std::fs::create_dir_all(&dir);
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            self.status_banner = format!("Cannot create export directory: {e}");
+            return;
+        }
         let stem = self
             .raw_recording
             .source_name
@@ -2525,19 +3390,15 @@ impl SonoWingApp {
         }
     }
 
-    fn export_workset_envelope(&mut self) {
-        let dir = PathBuf::from(self.export_dir_input.trim());
-        let _ = std::fs::create_dir_all(&dir);
-        let stem = self
-            .raw_recording
-            .source_name
-            .rsplit_once('.')
-            .map(|(s, _)| s)
-            .unwrap_or(&self.raw_recording.source_name);
-        let p = dir.join(format!("{stem}.sonoworkset.json"));
-        let payload = WorksetPayload {
+    fn build_current_workset_payload(&self) -> WorksetPayload {
+        WorksetPayload {
             schema_version: "1.1.0".to_string(),
             source_name: self.raw_recording.source_name.clone(),
+            source_path: self
+                .current_source_path
+                .as_ref()
+                .map(|p| p.display().to_string()),
+            preset_code: self.current_preset.map(|p| p.code().to_string()),
             sample_rate_hz: self.raw_recording.sample_rate_hz,
             duration_s: self.raw_recording.duration_s(),
             guano: self.raw_recording.guano.clone(),
@@ -2545,7 +3406,23 @@ impl SonoWingApp {
             harmonic_profiles: self.harmonic_profiles.clone(),
             cluster_report: self.cluster_report.clone(),
             soundscape_indices: self.soundscape_indices.clone(),
-        };
+        }
+    }
+
+    fn export_workset_envelope(&mut self) {
+        let dir = PathBuf::from(self.export_dir_input.trim());
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            self.status_banner = format!("Cannot create export directory: {e}");
+            return;
+        }
+        let stem = self
+            .raw_recording
+            .source_name
+            .rsplit_once('.')
+            .map(|(s, _)| s)
+            .unwrap_or(&self.raw_recording.source_name);
+        let p = dir.join(format!("{stem}.sonoworkset.json"));
+        let payload = self.build_current_workset_payload();
         match SignedWorksetEnvelope::build(payload).and_then(|env| env.save_to_file(&p)) {
             Ok(()) => {
                 self.status_banner =
@@ -2557,24 +3434,231 @@ impl SonoWingApp {
 
     fn render_central_waveform_and_spectrogram(&mut self, ctx: &egui::Context) {
         egui::CentralPanel::default().show(ctx, |ui| {
-            let avail = ui.available_size();
-            let wave_h = (avail.y * 0.27).clamp(95.0, 210.0);
-            let spec_h = (avail.y - wave_h - 10.0).max(150.0);
+            let dur_s = self.raw_recording.duration_s().max(0.05);
+            let nyq_khz = (self.raw_recording.nyquist_hz() * 0.001).max(1.0);
+            let t_span = (self.view_end_s - self.view_start_s).max(1e-5);
 
-            let (wave_rect, wave_resp) =
+            // Slim Canvas Transport & Zoom Toolbar
+            ui.horizontal_wrapped(|bar| {
+                if bar.button("Play 10x").clicked() {
+                    self.start_audio_playback(AuditionMode::TimeExpansion10x);
+                }
+                if bar.button("Play 20x").clicked() {
+                    self.start_audio_playback(AuditionMode::TimeExpansion20x);
+                }
+                if bar.button("Play Het").clicked() {
+                    self.start_audio_playback(AuditionMode::Heterodyne {
+                        carrier_khz: self.heterodyne_carrier_khz,
+                    });
+                }
+                if self.audio_player.is_playing() {
+                    let pause_lbl = if self.audio_player.is_paused() {
+                        "Resume"
+                    } else {
+                        "Pause"
+                    };
+                    if bar.button(pause_lbl).clicked() {
+                        self.audio_player.pause_or_resume();
+                    }
+                    if bar.button("Stop").clicked() {
+                        self.audio_player.stop();
+                        self.status_banner = "Stopped audio playback.".to_string();
+                    }
+                }
+                bar.separator();
+                if bar.button("Reset Zoom").clicked() {
+                    self.view_start_s = 0.0;
+                    self.view_end_s = dur_s;
+                    self.freq_min_khz = 0.0;
+                    self.freq_max_khz = nyq_khz;
+                    self.spec_dirty = true;
+                }
+                let win_lbl = if t_span <= 2.0 {
+                    format!(
+                        "Window: {:.1}-{:.1} ms | {:.1}-{:.1} kHz",
+                        self.view_start_s * 1000.0,
+                        self.view_end_s * 1000.0,
+                        self.freq_min_khz,
+                        self.freq_max_khz
+                    )
+                } else {
+                    format!(
+                        "Window: {:.2}-{:.2} s | {:.1}-{:.1} kHz",
+                        self.view_start_s,
+                        self.view_end_s,
+                        self.freq_min_khz,
+                        self.freq_max_khz
+                    )
+                };
+                bar.small(win_lbl);
+            });
+            ui.add_space(4.0);
+
+            let avail = ui.available_size();
+            let y_axis_w = 58.0_f32;
+            let right_pad = 14.0_f32;
+            let x_axis_h = 24.0_f32;
+
+            let wave_h = (avail.y * 0.26).clamp(88.0, 196.0);
+            let spec_outer_h = (avail.y - wave_h - 10.0).max(150.0);
+
+            let (wave_outer, wave_resp) =
                 ui.allocate_exact_size(Vec2::new(avail.x, wave_h), Sense::click_and_drag());
-            self.paint_oscillogram(ui.painter_at(wave_rect), wave_rect);
+            let wave_plot_rect = Rect::from_min_max(
+                Pos2::new((wave_outer.left() + y_axis_w).min(wave_outer.right() - 40.0), wave_outer.top()),
+                Pos2::new((wave_outer.right() - right_pad).max(wave_outer.left() + y_axis_w + 20.0), wave_outer.bottom()),
+            );
+            self.paint_oscillogram(
+                ui.painter_at(wave_outer),
+                ui.painter_at(wave_plot_rect),
+                wave_outer,
+                wave_plot_rect,
+            );
 
             ui.add_space(6.0);
 
-            let (spec_rect, spec_resp) =
-                ui.allocate_exact_size(Vec2::new(avail.x, spec_h), Sense::click_and_drag());
-            self.paint_spectrogram_canvas(ui.painter_at(spec_rect), spec_rect, &spec_resp);
+            let (spec_outer, spec_resp) =
+                ui.allocate_exact_size(Vec2::new(avail.x, spec_outer_h), Sense::click_and_drag());
+            let spec_plot_rect = Rect::from_min_max(
+                Pos2::new((spec_outer.left() + y_axis_w).min(spec_outer.right() - 40.0), spec_outer.top()),
+                Pos2::new(
+                    (spec_outer.right() - right_pad).max(spec_outer.left() + y_axis_w + 20.0),
+                    (spec_outer.bottom() - x_axis_h).max(spec_outer.top() + 40.0),
+                ),
+            );
+            self.paint_spectrogram_canvas(
+                ui.painter_at(spec_outer),
+                ui.painter_at(spec_plot_rect),
+                spec_outer,
+                spec_plot_rect,
+                &spec_resp,
+            );
 
-            for (rect, resp) in [(wave_rect, &wave_resp), (spec_rect, &spec_resp)] {
-                if resp.clicked() || resp.dragged() {
+            // Double-click either canvas resets full zoom
+            if wave_resp.double_clicked() || spec_resp.double_clicked() {
+                self.view_start_s = 0.0;
+                self.view_end_s = dur_s;
+                self.freq_min_khz = 0.0;
+                self.freq_max_khz = nyq_khz;
+                self.spec_dirty = true;
+            }
+
+            // Scroll-wheel zoom anchored under cursor
+            let pointer_pos = ctx.input(|i| i.pointer.hover_pos());
+            if let Some(ppos) = pointer_pos {
+                if wave_outer.contains(ppos) || spec_outer.contains(ppos) {
+                    let (scroll_y, zoom_delta, shift_down, ctrl_down) = ctx.input(|i| {
+                        (
+                            i.smooth_scroll_delta.y,
+                            i.zoom_delta(),
+                            i.modifiers.shift,
+                            i.modifiers.ctrl || i.modifiers.command,
+                        )
+                    });
+                    let zoom_factor = if (zoom_delta - 1.0).abs() > 1e-3 {
+                        (1.0 / zoom_delta as f64).clamp(0.5, 2.0)
+                    } else if scroll_y.abs() > 0.25 {
+                        0.85_f64.powf((scroll_y as f64) / 40.0)
+                    } else {
+                        1.0
+                    };
+                    if (zoom_factor - 1.0).abs() > 1e-4 {
+                        let in_y_gutter = spec_outer.contains(ppos) && ppos.x < spec_plot_rect.left();
+                        let in_x_gutter = spec_outer.contains(ppos) && ppos.y > spec_plot_rect.bottom();
+                        let in_wave = wave_outer.contains(ppos);
+                        let zoom_time = !in_y_gutter && (!shift_down || ctrl_down || in_wave || in_x_gutter);
+                        let zoom_freq = !in_wave && !in_x_gutter && (!ctrl_down || shift_down || in_y_gutter);
+
+                        if zoom_time {
+                            let u = ((ppos.x - spec_plot_rect.left()) / spec_plot_rect.width().max(1.0))
+                                .clamp(0.0, 1.0) as f64;
+                            let (ns, ne) = zoom_range_anchored(
+                                self.view_start_s,
+                                self.view_end_s,
+                                0.0,
+                                dur_s,
+                                u,
+                                zoom_factor,
+                                0.005_f64.min(dur_s),
+                            );
+                            self.view_start_s = ns;
+                            self.view_end_s = ne;
+                            self.spec_dirty = true;
+                        }
+                        if zoom_freq {
+                            let v = 1.0
+                                - ((ppos.y - spec_plot_rect.top()) / spec_plot_rect.height().max(1.0))
+                                    .clamp(0.0, 1.0) as f64;
+                            let (nf0, nf1) = zoom_range_anchored(
+                                self.freq_min_khz,
+                                self.freq_max_khz,
+                                0.0,
+                                nyq_khz,
+                                v,
+                                zoom_factor,
+                                1.0_f64.min(nyq_khz),
+                            );
+                            self.freq_min_khz = nf0;
+                            self.freq_max_khz = nf1;
+                            self.spec_dirty = true;
+                        }
+                    }
+                }
+            }
+
+            // Right-drag or middle-drag pan on spectrogram
+            let pan_delta = ctx.input(|i| {
+                if i.pointer.secondary_down() || i.pointer.middle_down() {
+                    i.pointer.delta()
+                } else {
+                    Vec2::ZERO
+                }
+            });
+            if (spec_resp.dragged_by(egui::PointerButton::Secondary)
+                || spec_resp.dragged_by(egui::PointerButton::Middle))
+                && pan_delta != Vec2::ZERO
+            {
+                let cur_t_span = (self.view_end_s - self.view_start_s).max(1e-4);
+                let cur_f_span = (self.freq_max_khz - self.freq_min_khz).max(0.2);
+                let dt = -(pan_delta.x as f64 / spec_plot_rect.width().max(1.0) as f64) * cur_t_span;
+                let df = (pan_delta.y as f64 / spec_plot_rect.height().max(1.0) as f64) * cur_f_span;
+
+                let mut ns = self.view_start_s + dt;
+                let mut ne = self.view_end_s + dt;
+                if ns < 0.0 {
+                    ne -= ns;
+                    ns = 0.0;
+                }
+                if ne > dur_s {
+                    ns -= ne - dur_s;
+                    ne = dur_s;
+                }
+                self.view_start_s = ns.max(0.0);
+                self.view_end_s = ne.min(dur_s).max(self.view_start_s + 1e-4);
+
+                let mut nf0 = self.freq_min_khz + df;
+                let mut nf1 = self.freq_max_khz + df;
+                if nf0 < 0.0 {
+                    nf1 -= nf0;
+                    nf0 = 0.0;
+                }
+                if nf1 > nyq_khz {
+                    nf0 -= nf1 - nyq_khz;
+                    nf1 = nyq_khz;
+                }
+                self.freq_min_khz = nf0.max(0.0);
+                self.freq_max_khz = nf1.min(nyq_khz).max(self.freq_min_khz + 0.5);
+                self.spec_dirty = true;
+            }
+
+            // Left-click / left-drag moves cursor playhead and selects call
+            for (plot_rect, resp) in [(wave_plot_rect, &wave_resp), (spec_plot_rect, &spec_resp)] {
+                if resp.clicked_by(egui::PointerButton::Primary)
+                    || resp.dragged_by(egui::PointerButton::Primary)
+                {
                     if let Some(pos) = resp.interact_pointer_pos() {
-                        let u = ((pos.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
+                        let u = ((pos.x - plot_rect.left()) / plot_rect.width().max(1.0))
+                            .clamp(0.0, 1.0);
                         let t_click =
                             self.view_start_s + (u as f64) * (self.view_end_s - self.view_start_s);
                         self.cursor_frame = self.time_to_frame(t_click);
@@ -2592,19 +3676,50 @@ impl SonoWingApp {
         });
     }
 
-    fn paint_oscillogram(&self, painter: egui::Painter, rect: Rect) {
+    fn paint_oscillogram(
+        &self,
+        outer_painter: egui::Painter,
+        painter: egui::Painter,
+        outer_rect: Rect,
+        rect: Rect,
+    ) {
+        // Y-gutter labels for oscillogram
+        let gutter_col = Color32::from_rgb(154, 174, 200);
+        outer_painter.text(
+            Pos2::new(rect.left() - 6.0, rect.top() + 4.0),
+            egui::Align2::RIGHT_TOP,
+            "+1.0",
+            FontId::monospace(9.5),
+            gutter_col,
+        );
+        outer_painter.text(
+            Pos2::new(rect.left() - 6.0, rect.center().y),
+            egui::Align2::RIGHT_CENTER,
+            "Amp",
+            FontId::monospace(9.5),
+            Color32::from_rgb(130, 198, 194),
+        );
+        outer_painter.text(
+            Pos2::new(rect.left() - 6.0, rect.bottom() - 4.0),
+            egui::Align2::RIGHT_BOTTOM,
+            "-1.0",
+            FontId::monospace(9.5),
+            gutter_col,
+        );
+        let _ = outer_rect;
+
         painter.rect_filled(rect, CornerRadius::same(4), Color32::from_rgb(12, 16, 23));
         painter.rect_stroke(
             rect,
             CornerRadius::same(4),
-            Stroke::new(1.0, Color32::from_rgb(44, 56, 74)),
+            Stroke::new(1.0_f32, Color32::from_rgb(44, 56, 74)),
             StrokeKind::Inside,
         );
 
         let mid_y = rect.center().y;
         painter.line_segment(
             [Pos2::new(rect.left(), mid_y), Pos2::new(rect.right(), mid_y)],
-            Stroke::new(1.0, Color32::from_rgb(35, 45, 60)),
+            Stroke::new(1.0_f32, Color32::from_rgb(35, 45, 60)),
         );
 
         let sr = self.raw_recording.sample_rate_hz as f64;
@@ -2622,7 +3737,7 @@ impl SonoWingApp {
             let y1 = mid_y - lo * half_h;
             painter.line_segment(
                 [Pos2::new(x, y0), Pos2::new(x, y1)],
-                Stroke::new(1.0, Color32::from_rgb(90, 210, 198)),
+                Stroke::new(1.0_f32, Color32::from_rgb(90, 210, 198)),
             );
         }
 
@@ -2639,7 +3754,10 @@ impl SonoWingApp {
                 let y = rect.bottom() - 4.0 - norm * (rect.height() * 0.42);
                 let pt = Pos2::new(x, y);
                 if let Some(p0) = prev {
-                    painter.line_segment([p0, pt], Stroke::new(1.2, Color32::from_rgb(248, 165, 75)));
+                    painter.line_segment(
+                        [p0, pt],
+                        Stroke::new(1.2_f32, Color32::from_rgb(248, 165, 75)),
+                    );
                 }
                 prev = Some(pt);
             }
@@ -2678,14 +3796,16 @@ impl SonoWingApp {
             let cx = rect.left() + ((cur_t - self.view_start_s) / t_span) as f32 * rect.width();
             painter.line_segment(
                 [Pos2::new(cx, rect.top()), Pos2::new(cx, rect.bottom())],
-                Stroke::new(1.3, Color32::from_rgb(255, 232, 120)),
+                Stroke::new(1.3_f32, Color32::from_rgb(255, 232, 120)),
             );
         }
     }
 
     fn paint_spectrogram_canvas(
         &self,
+        outer_painter: egui::Painter,
         painter: egui::Painter,
+        outer_rect: Rect,
         rect: Rect,
         resp: &egui::Response,
     ) {
@@ -2703,22 +3823,93 @@ impl SonoWingApp {
         let t_span = (self.view_end_s - self.view_start_s).max(1e-5);
         let f_span = (self.freq_max_khz - self.freq_min_khz).max(0.2);
 
-        for tick in 1..=5 {
-            let frac = tick as f32 / 6.0;
+        // Clean kHz Y-axis ticks & labels in left gutter
+        let axis_col = Color32::from_rgb(176, 194, 218);
+        let grid_stroke = Stroke::new(0.7_f32, Color32::from_rgba_unmultiplied(200, 215, 235, 34));
+        let tick_stroke = Stroke::new(1.0_f32, Color32::from_rgb(122, 142, 168));
+
+        outer_painter.text(
+            Pos2::new(rect.left() - 6.0, rect.top() + 2.0),
+            egui::Align2::RIGHT_TOP,
+            "kHz",
+            FontId::monospace(10.0),
+            Color32::from_rgb(132, 214, 200),
+        );
+        let y_ticks = nice_axis_ticks(self.freq_min_khz, self.freq_max_khz, 7);
+        let mut last_y_lbl = f32::INFINITY;
+        for fk in y_ticks {
+            let frac = ((fk - self.freq_min_khz) / f_span) as f32;
+            if !(-0.001..=1.001).contains(&frac) {
+                continue;
+            }
             let y = rect.bottom() - frac * rect.height();
-            let fk = self.freq_min_khz + (frac as f64) * f_span;
-            painter.line_segment(
-                [Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)],
-                Stroke::new(0.7, Color32::from_rgba_unmultiplied(200, 215, 235, 36)),
+            painter.line_segment([Pos2::new(rect.left(), y), Pos2::new(rect.right(), y)], grid_stroke);
+            outer_painter.line_segment(
+                [Pos2::new(rect.left() - 4.0, y), Pos2::new(rect.left(), y)],
+                tick_stroke,
             );
-            painter.text(
-                Pos2::new(rect.left() + 6.0, y - 2.0),
-                egui::Align2::LEFT_BOTTOM,
-                format!("{fk:.1} kHz"),
-                FontId::monospace(10.5),
-                Color32::from_rgb(215, 225, 240),
-            );
+            // Leave room near top for "kHz" unit label and avoid overlapping adjacent labels
+            if (last_y_lbl - y).abs() >= 18.0 && y >= rect.top() + 14.0 {
+                let lbl = if f_span < 5.0 {
+                    format!("{fk:.1}")
+                } else {
+                    format!("{fk:.0}")
+                };
+                outer_painter.text(
+                    Pos2::new(rect.left() - 6.0, y),
+                    egui::Align2::RIGHT_CENTER,
+                    lbl,
+                    FontId::monospace(10.0),
+                    axis_col,
+                );
+                last_y_lbl = y;
+            }
         }
+
+        // Clean ms / s X-axis ticks & labels in bottom gutter
+        let use_ms = t_span <= 2.0;
+        let x_ticks = nice_axis_ticks(self.view_start_s, self.view_end_s, 8);
+        let mut last_x_lbl = -1.0e6_f32;
+        for ts in x_ticks {
+            let frac = ((ts - self.view_start_s) / t_span) as f32;
+            if !(-0.001..=1.001).contains(&frac) {
+                continue;
+            }
+            let x = rect.left() + frac * rect.width();
+            painter.line_segment([Pos2::new(x, rect.top()), Pos2::new(x, rect.bottom())], grid_stroke);
+            outer_painter.line_segment(
+                [Pos2::new(x, rect.bottom()), Pos2::new(x, rect.bottom() + 4.0)],
+                tick_stroke,
+            );
+            if x - last_x_lbl >= 64.0 && x <= rect.right() - 18.0 {
+                let lbl = if use_ms {
+                    let ms = ts * 1000.0;
+                    if t_span * 1000.0 < 25.0 {
+                        format!("{ms:.1} ms")
+                    } else {
+                        format!("{ms:.0} ms")
+                    }
+                } else if t_span < 10.0 {
+                    format!("{ts:.2} s")
+                } else {
+                    format!("{ts:.1} s")
+                };
+                let align = if x < rect.left() + 26.0 {
+                    egui::Align2::LEFT_TOP
+                } else {
+                    egui::Align2::CENTER_TOP
+                };
+                outer_painter.text(
+                    Pos2::new(x, rect.bottom() + 6.0),
+                    align,
+                    lbl,
+                    FontId::monospace(10.0),
+                    axis_col,
+                );
+                last_x_lbl = x;
+            }
+        }
+        let _ = outer_rect;
 
         if self.show_zc_overlay {
             for d in &self.zc_dots {
@@ -2740,77 +3931,78 @@ impl SonoWingApp {
                 if ev.end_time_s < self.view_start_s || ev.begin_time_s > self.view_end_s {
                     continue;
                 }
-                let x0 = rect.left()
-                    + (((ev.begin_time_s - self.view_start_s) / t_span) as f32 * rect.width())
-                        .clamp(0.0, rect.width());
-                let x1 = rect.left()
-                    + (((ev.end_time_s - self.view_start_s) / t_span) as f32 * rect.width())
-                        .clamp(0.0, rect.width());
-                let y_hi = rect.bottom()
-                    - (((ev.f_max_khz - self.freq_min_khz) / f_span) as f32 * rect.height())
-                        .clamp(0.0, rect.height());
-                let y_lo = rect.bottom()
-                    - (((ev.f_min_khz - self.freq_min_khz) / f_span) as f32 * rect.height())
-                        .clamp(0.0, rect.height());
+                if ev.f_max_khz >= self.freq_min_khz && ev.f_min_khz <= self.freq_max_khz {
+                    let x0 = rect.left()
+                        + (((ev.begin_time_s - self.view_start_s) / t_span) as f32 * rect.width())
+                            .clamp(0.0, rect.width());
+                    let x1 = rect.left()
+                        + (((ev.end_time_s - self.view_start_s) / t_span) as f32 * rect.width())
+                            .clamp(0.0, rect.width());
+                    let y_hi = rect.bottom()
+                        - (((ev.f_max_khz - self.freq_min_khz) / f_span) as f32 * rect.height())
+                            .clamp(0.0, rect.height());
+                    let y_lo = rect.bottom()
+                        - (((ev.f_min_khz - self.freq_min_khz) / f_span) as f32 * rect.height())
+                            .clamp(0.0, rect.height());
 
-                let box_color = match ev.phase {
-                    BehavioralPhase::TerminalFeedingBuzz => Color32::from_rgb(255, 102, 138),
-                    BehavioralPhase::ApproachPhase => Color32::from_rgb(255, 190, 88),
-                    BehavioralPhase::SearchPhase => Color32::from_rgb(88, 224, 255),
-                    BehavioralPhase::NocturnalFlightCall => Color32::from_rgb(118, 245, 158),
-                    BehavioralPhase::TerritorialOrContactVocalization => {
-                        Color32::from_rgb(172, 232, 118)
-                    }
-                };
-                let stroke_w = if Some(idx) == self.selected_call_idx {
-                    2.2
-                } else {
-                    1.2
-                };
-                let call_rect = Rect::from_min_max(
-                    Pos2::new(x0, y_hi.min(y_lo - 4.0)),
-                    Pos2::new(x1.max(x0 + 4.0), y_lo),
-                );
-                painter.rect_stroke(
-                    call_rect,
-                    CornerRadius::same(2),
-                    Stroke::new(stroke_w, box_color),
-                    StrokeKind::Inside,
-                );
+                    let box_color = match ev.phase {
+                        BehavioralPhase::TerminalFeedingBuzz => Color32::from_rgb(255, 102, 138),
+                        BehavioralPhase::ApproachPhase => Color32::from_rgb(255, 190, 88),
+                        BehavioralPhase::SearchPhase => Color32::from_rgb(88, 224, 255),
+                        BehavioralPhase::NocturnalFlightCall => Color32::from_rgb(118, 245, 158),
+                        BehavioralPhase::TerritorialOrContactVocalization => {
+                            Color32::from_rgb(172, 232, 118)
+                        }
+                    };
+                    let stroke_w = if Some(idx) == self.selected_call_idx {
+                        2.2_f32
+                    } else {
+                        1.2_f32
+                    };
+                    let call_rect = Rect::from_min_max(
+                        Pos2::new(x0, y_hi.min(y_lo - 4.0)),
+                        Pos2::new(x1.max(x0 + 4.0), y_lo),
+                    );
+                    painter.rect_stroke(
+                        call_rect,
+                        CornerRadius::same(2),
+                        Stroke::new(stroke_w, box_color),
+                        StrokeKind::Inside,
+                    );
 
-                let cl_badge = self
-                    .cluster_report
-                    .points
-                    .get(idx)
-                    .map(|p| format!("C{}", p.cluster_id + 1))
-                    .unwrap_or_default();
-                painter.text(
-                    Pos2::new(
-                        call_rect.left() + 2.0,
-                        (call_rect.top() - 13.0).max(rect.top() + 2.0),
-                    ),
-                    egui::Align2::LEFT_TOP,
-                    format!("#{} {} {}", ev.id, ev.primary_code(), cl_badge),
-                    FontId::monospace(10.5),
-                    box_color,
-                );
+                    let cl_badge = self
+                        .cluster_report
+                        .points
+                        .get(idx)
+                        .map(|p| format!("C{}", p.cluster_id + 1))
+                        .unwrap_or_default();
+                    let tag_x = call_rect.left().min(rect.right() - 74.0).max(rect.left() + 2.0);
+                    let tag_y = (call_rect.top() - 13.0).max(rect.top() + 2.0);
+                    painter.text(
+                        Pos2::new(tag_x, tag_y),
+                        egui::Align2::LEFT_TOP,
+                        format!("#{} {} {}", ev.id, ev.primary_code(), cl_badge),
+                        FontId::monospace(10.5),
+                        box_color,
+                    );
 
-                if self.show_ridge_overlay && ev.ridge_trace.len() >= 2 {
-                    for pair in ev.ridge_trace.windows(2) {
-                        let (t0, f0) = pair[0];
-                        let (t1, f1) = pair[1];
-                        let px0 =
-                            rect.left() + ((t0 - self.view_start_s) / t_span) as f32 * rect.width();
-                        let py0 = rect.bottom()
-                            - ((f0 - self.freq_min_khz) / f_span) as f32 * rect.height();
-                        let px1 =
-                            rect.left() + ((t1 - self.view_start_s) / t_span) as f32 * rect.width();
-                        let py1 = rect.bottom()
-                            - ((f1 - self.freq_min_khz) / f_span) as f32 * rect.height();
-                        painter.line_segment(
-                            [Pos2::new(px0, py0), Pos2::new(px1, py1)],
-                            Stroke::new(1.8, Color32::from_rgb(120, 255, 235)),
-                        );
+                    if self.show_ridge_overlay && ev.ridge_trace.len() >= 2 {
+                        for pair in ev.ridge_trace.windows(2) {
+                            let (t0, f0) = pair[0];
+                            let (t1, f1) = pair[1];
+                            let px0 = rect.left()
+                                + ((t0 - self.view_start_s) / t_span) as f32 * rect.width();
+                            let py0 = rect.bottom()
+                                - ((f0 - self.freq_min_khz) / f_span) as f32 * rect.height();
+                            let px1 = rect.left()
+                                + ((t1 - self.view_start_s) / t_span) as f32 * rect.width();
+                            let py1 = rect.bottom()
+                                - ((f1 - self.freq_min_khz) / f_span) as f32 * rect.height();
+                            painter.line_segment(
+                                [Pos2::new(px0, py0), Pos2::new(px1, py1)],
+                                Stroke::new(1.8_f32, Color32::from_rgb(120, 255, 235)),
+                            );
+                        }
                     }
                 }
 
@@ -2826,7 +4018,9 @@ impl SonoWingApp {
                             for pair in pts.windows(2) {
                                 let (t0, f0) = pair[0];
                                 let (t1, f1) = pair[1];
-                                if f0 > self.freq_max_khz && f1 > self.freq_max_khz {
+                                if (f0 > self.freq_max_khz && f1 > self.freq_max_khz)
+                                    || (f0 < self.freq_min_khz && f1 < self.freq_min_khz)
+                                {
                                     continue;
                                 }
                                 let px0 = rect.left()
@@ -2839,7 +4033,7 @@ impl SonoWingApp {
                                     - ((f1 - self.freq_min_khz) / f_span) as f32 * rect.height();
                                 painter.line_segment(
                                     [Pos2::new(px0, py0), Pos2::new(px1, py1)],
-                                    Stroke::new(1.3, h_col),
+                                    Stroke::new(1.3_f32, h_col),
                                 );
                             }
                         }
@@ -2853,7 +4047,7 @@ impl SonoWingApp {
             let cx = rect.left() + ((cur_t - self.view_start_s) / t_span) as f32 * rect.width();
             painter.line_segment(
                 [Pos2::new(cx, rect.top()), Pos2::new(cx, rect.bottom())],
-                Stroke::new(1.2, Color32::from_rgb(255, 232, 120)),
+                Stroke::new(1.2_f32, Color32::from_rgb(255, 232, 120)),
             );
         }
 
@@ -2867,10 +4061,21 @@ impl SonoWingApp {
                 let bin = self.spectrogram.freq_to_bin(hf_khz * 1000.0);
                 let db = self.spectrogram.db_at(fr, bin);
 
+                let text = format!("Hover: {ht_s:.4} s | {hf_khz:.2} kHz | {db:.1} dBFS");
+                let pill_w = (text.len() as f32) * 6.8 + 14.0;
+                let pill_rect = Rect::from_min_max(
+                    Pos2::new((rect.right() - 8.0 - pill_w).max(rect.left() + 4.0), rect.top() + 4.0),
+                    Pos2::new(rect.right() - 4.0, rect.top() + 23.0),
+                );
+                painter.rect_filled(
+                    pill_rect,
+                    CornerRadius::same(4),
+                    Color32::from_rgba_unmultiplied(10, 14, 22, 212),
+                );
                 painter.text(
-                    Pos2::new(rect.right() - 8.0, rect.top() + 6.0),
+                    Pos2::new(rect.right() - 10.0, rect.top() + 6.0),
                     egui::Align2::RIGHT_TOP,
-                    format!("Hover: {ht_s:.4} s | {hf_khz:.2} kHz | {db:.1} dBFS"),
+                    text,
                     FontId::monospace(11.0),
                     Color32::from_rgb(255, 244, 180),
                 );
@@ -2880,7 +4085,7 @@ impl SonoWingApp {
         painter.rect_stroke(
             rect,
             CornerRadius::same(4),
-            Stroke::new(1.0, Color32::from_rgb(50, 62, 82)),
+            Stroke::new(1.0_f32, Color32::from_rgb(50, 62, 82)),
             StrokeKind::Inside,
         );
     }
@@ -2890,7 +4095,7 @@ impl SonoWingApp {
         painter.rect_stroke(
             rect,
             CornerRadius::same(4),
-            Stroke::new(1.0, Color32::from_rgb(46, 58, 76)),
+            Stroke::new(1.0_f32, Color32::from_rgb(46, 58, 76)),
             StrokeKind::Inside,
         );
 
@@ -2910,10 +4115,42 @@ impl SonoWingApp {
             let y = rect.bottom() - 4.0 - norm * (rect.height() - 10.0);
             let pt = Pos2::new(x, y);
             if let Some(p0) = prev {
-                painter.line_segment([p0, pt], Stroke::new(1.3, Color32::from_rgb(112, 224, 196)));
+                painter.line_segment(
+                    [p0, pt],
+                    Stroke::new(1.3_f32, Color32::from_rgb(112, 224, 196)),
+                );
             }
             prev = Some(pt);
         }
+    }
+
+    fn render_about_modal(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_about_modal;
+        egui::Window::new("About SonoWing v1.1.0")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .default_width(470.0)
+            .show(ctx, |ui| {
+                ui.heading("SonoWing v1.1.0");
+                ui.label(
+                    "Native safe-Rust bat echolocation and avian vocalization sonic/ultrasonic \
+                     spectrogram, harmonic stack, MFCC/UMAP clustering, and GUANO v1.0 workstation.",
+                );
+                ui.add_space(6.0);
+                ui.strong("Copyright CRV Science Network");
+                ui.label(
+                    "Licensed under GNU General Public License v3.0 or later (GPL-3.0-or-later). \
+                     This program comes with ABSOLUTELY NO WARRANTY.",
+                );
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.hyperlink_to("CRV Science Network", "https://crvscience.com");
+                    ui.separator();
+                    ui.hyperlink_to("CRV Science Apps Catalog", "https://crvscience.com/apps");
+                });
+            });
+        self.show_about_modal = open;
     }
 
     fn render_reference_modal(&mut self, ctx: &egui::Context) {
@@ -2989,10 +4226,75 @@ impl SonoWingApp {
             });
         if let Some(id) = chosen_id {
             self.load_sqlite_session(id);
+            ctx.request_repaint();
             open = false;
         }
         self.show_sessions_modal = open;
     }
+}
+
+/// Generate clean `1-2-5 * 10^n` axis tick values inside `[min_val, max_val]`.
+pub fn nice_axis_ticks(min_val: f64, max_val: f64, target_ticks: usize) -> Vec<f64> {
+    if !min_val.is_finite() || !max_val.is_finite() || max_val <= min_val {
+        return Vec::new();
+    }
+    let span = max_val - min_val;
+    let rough_step = span / (target_ticks.max(2) as f64);
+    let mag = 10.0_f64.powf(rough_step.log10().floor());
+    let norm = rough_step / mag;
+    let nice_mult = if norm < 1.5 {
+        1.0
+    } else if norm < 3.0 {
+        2.0
+    } else if norm < 7.0 {
+        5.0
+    } else {
+        10.0
+    };
+    let step = (nice_mult * mag).max(1e-9);
+    let eps = step * 1e-6;
+    let first = ((min_val - eps) / step).ceil() * step;
+    let mut ticks = Vec::new();
+    let mut v = first;
+    for _ in 0..64 {
+        if v > max_val + eps {
+            break;
+        }
+        ticks.push(if v.abs() < eps { 0.0 } else { v });
+        v += step;
+    }
+    ticks
+}
+
+/// Anchor-preserving zoom calculation keeping `anchor_frac` in `[0, 1]` at the same world coordinate.
+pub fn zoom_range_anchored(
+    cur_min: f64,
+    cur_max: f64,
+    bound_min: f64,
+    bound_max: f64,
+    anchor_frac: f64,
+    factor: f64,
+    min_span: f64,
+) -> (f64, f64) {
+    let total_span = (bound_max - bound_min).max(1e-9);
+    let cur_span = (cur_max - cur_min).max(1e-9);
+    let clamped_min_span = min_span.max(1e-9).min(total_span);
+    let new_span = (cur_span * factor).clamp(clamped_min_span, total_span);
+    let anchor = cur_min + anchor_frac.clamp(0.0, 1.0) * cur_span;
+    let mut new_min = anchor - anchor_frac.clamp(0.0, 1.0) * new_span;
+    let mut new_max = new_min + new_span;
+    if new_min < bound_min {
+        new_max += bound_min - new_min;
+        new_min = bound_min;
+    }
+    if new_max > bound_max {
+        new_min -= new_max - bound_max;
+        new_max = bound_max;
+    }
+    (
+        new_min.max(bound_min),
+        new_max.min(bound_max).max(new_min.max(bound_min) + 1e-9),
+    )
 }
 
 pub fn load_any_bioacoustic_path(path: &Path) -> Result<BioAcousticRecording, String> {
@@ -3014,4 +4316,53 @@ fn configure_dark_scientific_theme(ctx: &egui::Context) {
     visuals.panel_fill = Color32::from_rgb(15, 19, 27);
     visuals.window_fill = Color32::from_rgb(18, 23, 33);
     ctx.set_visuals(visuals);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nice_axis_ticks_and_zoom_math_are_clean_and_bounded() {
+        let khz_ticks = nice_axis_ticks(0.0, 125.0, 7);
+        assert_eq!(
+            khz_ticks,
+            vec![0.0, 20.0, 40.0, 60.0, 80.0, 100.0, 120.0]
+        );
+
+        let ms_ticks = nice_axis_ticks(0.0, 0.28, 8);
+        assert_eq!(ms_ticks.len(), 6);
+        assert!((ms_ticks[1] - 0.05).abs() < 1e-9);
+        assert!((ms_ticks[5] - 0.25).abs() < 1e-9);
+
+        // Anchor at 0.4 of [0.0, 1.0] (world = 0.4) with 0.5x zoom -> span 0.5, [0.2, 0.7]
+        let (z0, z1) = zoom_range_anchored(0.0, 1.0, 0.0, 1.0, 0.4, 0.5, 0.01);
+        assert!((z0 - 0.2).abs() < 1e-9 && (z1 - 0.7).abs() < 1e-9);
+        let anchor_after = z0 + 0.4 * (z1 - z0);
+        assert!((anchor_after - 0.4).abs() < 1e-9);
+
+        // Zooming out past bounds clamps cleanly
+        let (b0, b1) = zoom_range_anchored(0.1, 0.5, 0.0, 1.0, 0.2, 10.0, 0.01);
+        assert_eq!((b0, b1), (0.0, 1.0));
+    }
+
+    #[test]
+    fn guano_editor_draft_handles_multiline_notes_and_validation() {
+        let mut g = GuanoMetadata::new_v1();
+        g.samplerate_hz = Some(250_000);
+        g.note = Some("Line 1\nLine 2".to_string());
+        let text = g.to_guano_text();
+        let reparsed = GuanoMetadata::parse_text(&text);
+        assert_eq!(reparsed.note.as_deref(), Some("Line 1\nLine 2"));
+
+        let mut draft = GuanoEditorDraft::from_guano(Some(&reparsed), 250_000, 0.28);
+        assert_eq!(draft.note, "Line 1\nLine 2");
+        draft.humidity_pct = "120.0".to_string();
+        assert!(draft.to_guano(0.28).is_err());
+
+        draft.humidity_pct = "68.5".to_string();
+        draft.loc_lat = "44.5".to_string();
+        draft.loc_lon = "".to_string();
+        assert!(draft.to_guano(0.28).is_err());
+    }
 }
