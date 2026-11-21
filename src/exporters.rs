@@ -422,7 +422,7 @@ fn sanitize_finite(v: f64) -> f64 {
     }
 }
 
-fn csv_escape(field: &str) -> String {
+pub fn csv_escape(field: &str) -> String {
     if field.contains([',', '"', '\n', '\r']) {
         format!("\"{}\"", field.replace('"', "\"\""))
     } else {
@@ -480,5 +480,13 @@ mod tests {
         let after = SignedWorksetEnvelope::canonical_payload_json(&loaded.payload).unwrap();
         let _ = std::fs::remove_file(&ws_path);
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn csv_escape_handles_rfc4180_commas_quotes_and_newlines() {
+        assert_eq!(csv_escape("MYLU_Demo.wav"), "MYLU_Demo.wav");
+        assert_eq!(csv_escape("site_A, plot_2.wav"), "\"site_A, plot_2.wav\"");
+        assert_eq!(csv_escape("call_\"buzz\".wav"), "\"call_\"\"buzz\"\".wav\"");
+        assert_eq!(csv_escape("line1\nline2"), "\"line1\nline2\"");
     }
 }

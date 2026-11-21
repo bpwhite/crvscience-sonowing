@@ -1092,15 +1092,53 @@ impl SonoWingApp {
             self.load_external_path(first_path);
         }
 
-        if ctx.input(|i| i.key_pressed(egui::Key::F1)) {
+        let wants_kb = ctx.wants_keyboard_input();
+        let (esc_pressed, space_pressed, f1_pressed, f5_pressed, f9_pressed) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::Escape),
+                i.key_pressed(egui::Key::Space),
+                i.key_pressed(egui::Key::F1),
+                i.key_pressed(egui::Key::F5),
+                i.key_pressed(egui::Key::F9),
+            )
+        });
+
+        if esc_pressed {
+            if self.show_about_modal {
+                self.show_about_modal = false;
+            } else if self.show_reference_modal {
+                self.show_reference_modal = false;
+            } else if self.show_sessions_modal {
+                self.show_sessions_modal = false;
+            }
+        }
+        if f1_pressed {
             self.show_reference_modal = !self.show_reference_modal;
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::F5)) {
+        if f5_pressed {
             self.quick_save_sqlite();
         }
-        if ctx.input(|i| i.key_pressed(egui::Key::F9)) {
+        if f9_pressed {
             self.refresh_sessions_list();
             self.show_sessions_modal = true;
+        }
+        let any_modal_open =
+            self.show_about_modal || self.show_reference_modal || self.show_sessions_modal;
+        if space_pressed
+            && self.stage == AppStage::Workstation
+            && !any_modal_open
+            && !wants_kb
+        {
+            if self.audio_player.is_playing() {
+                self.audio_player.pause_or_resume();
+                self.status_banner = if self.audio_player.is_paused() {
+                    "Paused audible playback.".to_string()
+                } else {
+                    "Resumed audible playback.".to_string()
+                };
+            } else {
+                self.start_audio_playback(self.audition_mode);
+            }
         }
 
         if self.stage == AppStage::StartupHub {
@@ -2126,7 +2164,11 @@ impl SonoWingApp {
                     ui.strong("Live Mic & File Input");
                     ui.horizontal(|ui| {
                         if !self.live_mic.is_capturing() {
-                            if ui.button("Live Mic").clicked() {
+                            if ui
+                                .button("Live Mic")
+                                .on_hover_text("Capture live audio from default hardware microphone (falls back to simulated 192 kHz stream if unavailable)")
+                                .clicked()
+                            {
                                 self.last_live_refresh = Instant::now();
                                 if let Err(e) = self.live_mic.start_hardware_capture(
                                     self.mic_window_seconds,
@@ -2140,14 +2182,22 @@ impl SonoWingApp {
                                     self.status_banner = "Hardware live microphone streaming...".to_string();
                                 }
                             }
-                            if ui.button("Sim Stream").clicked() {
+                            if ui
+                                .button("Sim Stream")
+                                .on_hover_text("Stream synthetic 192 kHz nocturnal bat/bird audio into the rolling live buffer")
+                                .clicked()
+                            {
                                 self.last_live_refresh = Instant::now();
                                 let lbl = self
                                     .live_mic
                                     .start_simulated_stream(self.mic_window_seconds, true);
                                 self.status_banner = format!("Streaming {lbl}");
                             }
-                        } else if ui.button("Freeze & Stop Mic").clicked() {
+                        } else if ui
+                            .button("Freeze & Stop Mic")
+                            .on_hover_text("Freeze the rolling capture buffer into a static recording and run full DSP extraction")
+                            .clicked()
+                        {
                             if let Some(rec) = self.live_mic.freeze_to_recording() {
                                 self.live_mic.stop();
                                 self.raw_recording = rec;
@@ -2164,8 +2214,13 @@ impl SonoWingApp {
                             egui::TextEdit::singleline(&mut self.file_path_input)
                                 .desired_width(142.0)
                                 .hint_text("WAV or .zc file path"),
-                        );
-                        if ui.button("Browse...").clicked() {
+                        )
+                        .on_hover_text("Path to a .wav (8-500 kHz) or Anabat .zc/.zcf recording");
+                        if ui
+                            .button("Browse...")
+                            .on_hover_text("Choose a .wav or Anabat .zc/.zcf file from disk")
+                            .clicked()
+                        {
                             if let Some(path) = rfd::FileDialog::new()
                                 .add_filter("Bioacoustic Audio", &["wav", "WAV", "zc", "ZCF", "zcf"])
                                 .pick_file()
@@ -2174,7 +2229,12 @@ impl SonoWingApp {
                                 self.load_external_path(&path);
                             }
                         }
-                        if ui.button("Load").clicked() && !self.file_path_input.trim().is_empty() {
+                        if ui
+                            .button("Load")
+                            .on_hover_text("Load the recording path entered in the text box")
+                            .clicked()
+                            && !self.file_path_input.trim().is_empty()
+                        {
                             let p = PathBuf::from(self.file_path_input.trim());
                             self.load_external_path(&p);
                         }
@@ -2205,7 +2265,9 @@ impl SonoWingApp {
                                     dsp_changed = true;
                                 }
                             }
-                        });
+                        })
+                        .response
+                        .on_hover_text("STFT window length N: larger FFT sharpens frequency resolution at the expense of temporal resolution");
 
                     egui::ComboBox::from_label("Hop Step")
                         .selected_text(format!("{} samp", self.stft_cfg.hop_size))
@@ -2222,7 +2284,9 @@ impl SonoWingApp {
                                     dsp_changed = true;
                                 }
                             }
-                        });
+                        })
+                        .response
+                        .on_hover_text("Samples advanced per STFT frame; smaller hop yields finer time-domain tracking of FM sweeps");
 
                     egui::ComboBox::from_label("Window")
                         .selected_text(self.stft_cfg.window.label())
@@ -2235,13 +2299,16 @@ impl SonoWingApp {
                                     dsp_changed = true;
                                 }
                             }
-                        });
+                        })
+                        .response
+                        .on_hover_text("Spectral taper applied before FFT to control mainlobe width vs. sidelobe leakage");
 
                     if ui
                         .checkbox(
                             &mut self.stft_cfg.subtract_median_noise_floor,
                             "Median Per-Bin Spectral Denoising",
                         )
+                        .on_hover_text("Subtract per-frequency-bin temporal median energy to suppress stationary wind, insect, or electronics noise")
                         .changed()
                     {
                         dsp_changed = true;
@@ -2252,6 +2319,7 @@ impl SonoWingApp {
                     let nyq_khz = (self.raw_recording.nyquist_hz() * 0.001).max(1.0);
                     if ui
                         .checkbox(&mut self.apply_bandpass, "Enable 4th-Order Zero-Phase Bandpass")
+                        .on_hover_text("Forward-backward SOS Butterworth filter preserving zero phase distortion across call contours")
                         .changed()
                     {
                         dsp_changed = true;
@@ -2262,6 +2330,7 @@ impl SonoWingApp {
                                 egui::Slider::new(&mut self.bandpass_low_khz, 0.2..=(nyq_khz * 0.9))
                                     .text("High-Pass (kHz)"),
                             )
+                            .on_hover_text("Lower cutoff frequency for the zero-phase bandpass filter")
                             .changed()
                         {
                             dsp_changed = true;
@@ -2274,6 +2343,7 @@ impl SonoWingApp {
                                 )
                                 .text("Low-Pass (kHz)"),
                             )
+                            .on_hover_text("Upper cutoff frequency for the zero-phase bandpass filter")
                             .changed()
                         {
                             dsp_changed = true;
@@ -2293,12 +2363,15 @@ impl SonoWingApp {
                                     dsp_changed = true;
                                 }
                             }
-                        });
+                        })
+                        .response
+                        .on_hover_text("Restrict detector search to Ultrasonic Bat, Audible Bird, or Dual Auto-Wideband regimes");
                     if ui
                         .add(
                             egui::Slider::new(&mut self.detector_cfg.snr_threshold_db, 6.0..=28.0)
                                 .text("Trigger SNR (dB)"),
                         )
+                        .on_hover_text("Minimum SNR above per-band noise floor required to segment a call event")
                         .changed()
                     {
                         dsp_changed = true;
@@ -2308,6 +2381,7 @@ impl SonoWingApp {
                             egui::Slider::new(&mut self.detector_cfg.min_duration_ms, 0.8..=80.0)
                                 .text("Min Duration (ms)"),
                         )
+                        .on_hover_text("Discard transient clicks shorter than this duration threshold")
                         .changed()
                     {
                         dsp_changed = true;
@@ -2326,6 +2400,7 @@ impl SonoWingApp {
                             egui::Slider::new(&mut self.view_start_s, 0.0..=(dur_s * 0.95))
                                 .text("Start (s)"),
                         )
+                        .on_hover_text("Start time of the visible spectrogram and waveform window")
                         .changed();
                     view_changed |= ui
                         .add(
@@ -2335,12 +2410,14 @@ impl SonoWingApp {
                             )
                             .text("End (s)"),
                         )
+                        .on_hover_text("End time of the visible spectrogram and waveform window")
                         .changed();
                     view_changed |= ui
                         .add(
                             egui::Slider::new(&mut self.freq_min_khz, 0.0..=(nyq_khz * 0.85))
                                 .text("Min Freq (kHz)"),
                         )
+                        .on_hover_text("Lower frequency bound of the spectrogram display and spectrum slice")
                         .changed();
                     view_changed |= ui
                         .add(
@@ -2350,32 +2427,40 @@ impl SonoWingApp {
                             )
                             .text("Max Freq (kHz)"),
                         )
+                        .on_hover_text("Upper frequency bound of the spectrogram display and spectrum slice")
                         .changed();
                     view_changed |= ui
                         .add(
                             egui::Slider::new(&mut self.dynamic_range_db, 30.0..=96.0)
                                 .text("Dyn Range (dB)"),
                         )
+                        .on_hover_text("Spectrogram color contrast span in decibels below ceiling")
                         .changed();
                     view_changed |= ui
                         .add(
                             egui::Slider::new(&mut self.gain_offset_db, -24.0..=24.0)
                                 .text("Gain Offset (dB)"),
                         )
+                        .on_hover_text("Display brightness offset applied to spectrogram magnitude in dBFS")
                         .changed();
 
                     if view_changed {
                         self.spec_dirty = true;
                     }
 
-                    ui.checkbox(&mut self.show_call_boxes, "Show Bounding Boxes & Cluster/Taxon Tags");
-                    ui.checkbox(&mut self.show_ridge_overlay, "Show Fundamental Peak Ridge");
+                    ui.checkbox(&mut self.show_call_boxes, "Show Bounding Boxes & Cluster/Taxon Tags")
+                        .on_hover_text("Draw time-frequency bounding boxes, species auto-IDs, and MFCC cluster badges over detections");
+                    ui.checkbox(&mut self.show_ridge_overlay, "Show Fundamental Peak Ridge")
+                        .on_hover_text("Overlay tracked fundamental frequency contour (f0) across each detected call");
                     ui.checkbox(
                         &mut self.show_harmonics_overlay,
                         "Show Harmonic Stack Overtones (2f0..5f0)",
-                    );
-                    ui.checkbox(&mut self.show_zc_overlay, "Overlay Anabat Zero-Crossing Dots");
-                    ui.checkbox(&mut self.show_tkeo_overlay, "Show Teager-Kaiser Energy on Waveform");
+                    )
+                    .on_hover_text("Overlay integer harmonic overtone ridges (2f0..5f0) tracked via subharmonic summation");
+                    ui.checkbox(&mut self.show_zc_overlay, "Overlay Anabat Zero-Crossing Dots")
+                        .on_hover_text("Plot zero-crossing instantaneous frequency dots on top of the full-spectrum spectrogram");
+                    ui.checkbox(&mut self.show_tkeo_overlay, "Show Teager-Kaiser Energy on Waveform")
+                        .on_hover_text("Overlay instantaneous Teager-Kaiser Energy Operator envelope on the waveform pane");
                 });
             });
     }
@@ -2793,7 +2878,7 @@ impl SonoWingApp {
                 StrokeKind::Inside,
             );
 
-            // Axes crosshairs
+            // Axes crosshairs & UMAP labels
             painter.line_segment(
                 [
                     Pos2::new(scatter_rect.left(), scatter_rect.center().y),
@@ -2808,7 +2893,25 @@ impl SonoWingApp {
                 ],
                 Stroke::new(0.8_f32, Color32::from_rgb(30, 40, 56)),
             );
+            let axis_col = Color32::from_rgb(138, 156, 182);
+            painter.text(
+                Pos2::new(scatter_rect.right() - 6.0, scatter_rect.center().y - 4.0),
+                egui::Align2::RIGHT_BOTTOM,
+                "UMAP-1",
+                FontId::monospace(9.5),
+                axis_col,
+            );
+            painter.text(
+                Pos2::new(scatter_rect.center().x + 6.0, scatter_rect.top() + 5.0),
+                egui::Align2::LEFT_TOP,
+                "UMAP-2",
+                FontId::monospace(9.5),
+                axis_col,
+            );
 
+            let hover_pos = resp.hover_pos();
+            let mut best_hover_dist = 12.0_f32;
+            let mut hovered_tip: Option<String> = None;
             let mut clicked_call: Option<usize> = None;
             for pt in &self.cluster_report.points {
                 let px = scatter_rect.center().x + (pt.umap_x as f32) * scatter_rect.width() * 0.44;
@@ -2829,6 +2932,32 @@ impl SonoWingApp {
                     col,
                 );
 
+                if let Some(hpos) = hover_pos {
+                    let d = hpos.distance(pos);
+                    if d <= best_hover_dist {
+                        best_hover_dist = d;
+                        let metrics = self
+                            .detected_calls
+                            .get(pt.call_index)
+                            .map(|ev| {
+                                format!(
+                                    " | Fc {:.2} kHz ({:.1} ms)",
+                                    ev.f_char_khz, ev.duration_ms
+                                )
+                            })
+                            .unwrap_or_default();
+                        hovered_tip = Some(format!(
+                            "Call #{} {} [C{}]{metrics}\nUMAP ({:+.3}, {:+.3}) | Silhouette {:+.3}\nClick to focus call on spectrogram",
+                            pt.call_id,
+                            pt.species_code,
+                            pt.cluster_id + 1,
+                            pt.umap_x,
+                            pt.umap_y,
+                            pt.silhouette
+                        ));
+                    }
+                }
+
                 if resp.clicked() {
                     if let Some(cpos) = resp.interact_pointer_pos() {
                         if cpos.distance(pos) <= 12.0 {
@@ -2836,6 +2965,9 @@ impl SonoWingApp {
                         }
                     }
                 }
+            }
+            if let Some(tip) = hovered_tip {
+                resp.clone().on_hover_text(tip);
             }
             if let Some(ci) = clicked_call {
                 self.selected_call_idx = Some(ci);
@@ -3292,8 +3424,17 @@ impl SonoWingApp {
         });
     }
 
+    fn resolved_export_dir(&self) -> PathBuf {
+        let trimmed = self.export_dir_input.trim();
+        if trimmed.is_empty() {
+            PathBuf::from(".")
+        } else {
+            PathBuf::from(trimmed)
+        }
+    }
+
     fn export_audible_wav(&mut self, mode: AuditionMode) {
-        let dir = PathBuf::from(self.export_dir_input.trim());
+        let dir = self.resolved_export_dir();
         if let Err(e) = std::fs::create_dir_all(&dir) {
             self.status_banner = format!("Cannot create export directory: {e}");
             return;
@@ -3318,7 +3459,7 @@ impl SonoWingApp {
     }
 
     fn export_raven_and_csv(&mut self, do_raven: bool, do_csv: bool) {
-        let dir = PathBuf::from(self.export_dir_input.trim());
+        let dir = self.resolved_export_dir();
         if let Err(e) = std::fs::create_dir_all(&dir) {
             self.status_banner = format!("Cannot create export directory: {e}");
             return;
@@ -3364,7 +3505,7 @@ impl SonoWingApp {
     }
 
     fn export_zc_file(&mut self) {
-        let dir = PathBuf::from(self.export_dir_input.trim());
+        let dir = self.resolved_export_dir();
         if let Err(e) = std::fs::create_dir_all(&dir) {
             self.status_banner = format!("Cannot create export directory: {e}");
             return;
@@ -3410,7 +3551,7 @@ impl SonoWingApp {
     }
 
     fn export_workset_envelope(&mut self) {
-        let dir = PathBuf::from(self.export_dir_input.trim());
+        let dir = self.resolved_export_dir();
         if let Err(e) = std::fs::create_dir_all(&dir) {
             self.status_banner = format!("Cannot create export directory: {e}");
             return;
@@ -4122,6 +4263,29 @@ impl SonoWingApp {
             }
             prev = Some(pt);
         }
+
+        let axis_col = Color32::from_rgb(148, 166, 192);
+        painter.text(
+            Pos2::new(rect.left() + 5.0, rect.top() + 3.0),
+            egui::Align2::LEFT_TOP,
+            "0 dBFS",
+            FontId::monospace(9.5),
+            axis_col,
+        );
+        painter.text(
+            Pos2::new(rect.left() + 5.0, rect.bottom() - 3.0),
+            egui::Align2::LEFT_BOTTOM,
+            "-96 dBFS",
+            FontId::monospace(9.5),
+            axis_col,
+        );
+        painter.text(
+            Pos2::new(rect.right() - 5.0, rect.bottom() - 3.0),
+            egui::Align2::RIGHT_BOTTOM,
+            format!("{:.0}–{:.0} kHz", self.freq_min_khz, self.freq_max_khz),
+            FontId::monospace(9.5),
+            axis_col,
+        );
     }
 
     fn render_about_modal(&mut self, ctx: &egui::Context) {
@@ -4159,7 +4323,7 @@ impl SonoWingApp {
             .open(&mut open)
             .default_width(780.0)
             .show(ctx, |ui| {
-                ui.label("Shortcuts: F1 = Reference Key | F5 = Save SQLite WAL Session | F9 = Load SQLite Session | Drag & Drop .wav/.zc onto window");
+                ui.label("Shortcuts: Space = Play/Pause Audition | Esc = Close Modal | F1 = Reference Key | F5 = Save SQLite WAL Session | F9 = Load SQLite Session | Drag & Drop .wav/.zc onto window");
                 ui.separator();
                 egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
                     egui::Grid::new("ref_species_modal_grid")
@@ -4364,5 +4528,108 @@ mod tests {
         draft.loc_lat = "44.5".to_string();
         draft.loc_lon = "".to_string();
         assert!(draft.to_guano(0.28).is_err());
+    }
+
+    #[test]
+    fn resolved_export_dir_guards_empty_and_whitespace() {
+        let tmp_db = std::env::temp_dir().join(format!(
+            "sonowing_export_dir_test_{}.sqlite3",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp_db);
+        let ctx = egui::Context::default();
+        let mut app = SonoWingApp::new_headless(&ctx, None, true, tmp_db.clone());
+        assert_eq!(app.resolved_export_dir(), PathBuf::from("exports"));
+
+        app.export_dir_input = "".to_string();
+        assert_eq!(app.resolved_export_dir(), PathBuf::from("."));
+
+        app.export_dir_input = "   \t ".to_string();
+        assert_eq!(app.resolved_export_dir(), PathBuf::from("."));
+
+        app.export_dir_input = "  field_out  ".to_string();
+        assert_eq!(app.resolved_export_dir(), PathBuf::from("field_out"));
+        let _ = std::fs::remove_file(&tmp_db);
+    }
+
+    #[test]
+    fn headless_escape_dismisses_modals_in_priority_order_and_renders_axis_labels() {
+        let tmp_db = std::env::temp_dir().join(format!(
+            "sonowing_modal_esc_test_{}.sqlite3",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp_db);
+        let ctx = egui::Context::default();
+        let mut app = SonoWingApp::new_headless(&ctx, None, true, tmp_db.clone());
+        ctx.data_mut(|d| {
+            d.insert_temp(
+                egui::Id::new("sonowing_bottom_tab_v11"),
+                BottomDockTab::MfccUmapClusters,
+            );
+        });
+
+        let run_frame = |ctx: &egui::Context, app: &mut SonoWingApp, events: Vec<egui::Event>| {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1480.0, 920.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            ctx.run(raw, |c| app.ui_step(c))
+        };
+
+        let esc = || egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+
+        // Warm up frame and inspect spectrum slice & UMAP labels
+        let _ = run_frame(&ctx, &mut app, vec![]);
+        let out = run_frame(&ctx, &mut app, vec![]);
+        let mut texts = Vec::new();
+        fn walk(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(ts) => out.push(ts.galley.text().to_string()),
+                egui::Shape::Vec(items) => {
+                    for s in items {
+                        walk(s, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for cs in &out.shapes {
+            walk(&cs.shape, &mut texts);
+        }
+        let joined = texts.join("\n");
+        assert!(joined.contains("0 dBFS"), "Missing 0 dBFS label:\n{joined}");
+        assert!(joined.contains("-96 dBFS"), "Missing -96 dBFS label:\n{joined}");
+        assert!(joined.contains("UMAP-1"), "Missing UMAP-1 label:\n{joined}");
+        assert!(joined.contains("UMAP-2"), "Missing UMAP-2 label:\n{joined}");
+
+        // Priority order: show_about_modal -> show_reference_modal -> show_sessions_modal
+        app.show_about_modal = true;
+        app.show_reference_modal = true;
+        app.show_sessions_modal = true;
+
+        let _ = run_frame(&ctx, &mut app, vec![esc()]);
+        assert!(!app.show_about_modal);
+        assert!(app.show_reference_modal);
+        assert!(app.show_sessions_modal);
+
+        let _ = run_frame(&ctx, &mut app, vec![esc()]);
+        assert!(!app.show_reference_modal);
+        assert!(app.show_sessions_modal);
+
+        let _ = run_frame(&ctx, &mut app, vec![esc()]);
+        assert!(!app.show_sessions_modal);
+        assert_eq!(app.stage, AppStage::Workstation);
+
+        let _ = std::fs::remove_file(&tmp_db);
     }
 }

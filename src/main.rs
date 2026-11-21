@@ -25,7 +25,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use rayon::prelude::*;
 use sonowing::call_extractor::{extract_calls, DetectionMode, DetectorConfig, TaxonDomain};
 use sonowing::dsp::{compute_stft, StftConfig};
-use sonowing::exporters::{write_calls_csv, write_raven_selection_table};
+use sonowing::exporters::{csv_escape, write_calls_csv, write_raven_selection_table};
 use sonowing::gui::{load_any_bioacoustic_path, render_headless_screenshot, SonoWingApp};
 use sonowing::harmonic_tracker::analyze_harmonic_stacks;
 use sonowing::live_mic::LiveMicEngine;
@@ -592,7 +592,7 @@ fn run_batch(dir: &Path, out_dir: &Path, snr_db: f32) -> Result<(), String> {
         total_birds += an;
         manifest.push_str(&format!(
             "{},{},{},{},{},{},{:.2},{:+.4}\r\n",
-            name,
+            csv_escape(&name),
             sr,
             bn,
             an,
