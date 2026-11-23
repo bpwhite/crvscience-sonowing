@@ -64,71 +64,102 @@ pub enum ColormapPalette {
     MagmaBio,
     ViridisField,
     InfernoContrast,
+    CividisUniform,
     GrayscalePublication,
 }
 
+const fn build_lut_256(anchors: [[u8; 3]; 17]) -> [[u8; 3]; 256] {
+    let mut lut = [[0u8; 3]; 256];
+    let mut i = 0usize;
+    while i < 256 {
+        let scaled = i * 16;
+        let seg = scaled / 255;
+        let seg_clamped = if seg >= 16 { 15 } else { seg };
+        let rem = scaled - seg_clamped * 255;
+        let a = anchors[seg_clamped];
+        let b = anchors[seg_clamped + 1];
+        let r = (a[0] as usize * (255 - rem) + b[0] as usize * rem + 127) / 255;
+        let g = (a[1] as usize * (255 - rem) + b[1] as usize * rem + 127) / 255;
+        let bl = (a[2] as usize * (255 - rem) + b[2] as usize * rem + 127) / 255;
+        lut[i] = [r as u8, g as u8, bl as u8];
+        i += 1;
+    }
+    lut
+}
+
+const MAGMA_LUT_256: [[u8; 3]; 256] = build_lut_256([
+    [0, 0, 4], [12, 9, 38], [29, 17, 71], [51, 16, 104],
+    [79, 18, 123], [106, 28, 129], [134, 39, 129], [163, 48, 126],
+    [192, 58, 118], [219, 73, 104], [239, 96, 89], [250, 125, 81],
+    [254, 157, 108], [254, 188, 129], [253, 217, 155], [252, 238, 179],
+    [252, 253, 191],
+]);
+
+const VIRIDIS_LUT_256: [[u8; 3]; 256] = build_lut_256([
+    [68, 1, 84], [72, 24, 106], [71, 45, 123], [62, 74, 137],
+    [54, 92, 141], [46, 109, 142], [38, 130, 142], [31, 150, 139],
+    [34, 168, 132], [53, 183, 121], [84, 197, 104], [122, 209, 81],
+    [165, 219, 54], [202, 225, 31], [229, 228, 25], [244, 230, 30],
+    [253, 231, 37],
+]);
+
+const INFERNO_LUT_256: [[u8; 3]; 256] = build_lut_256([
+    [0, 0, 4], [16, 7, 45], [42, 11, 84], [74, 12, 107],
+    [105, 22, 110], [137, 34, 106], [168, 46, 95], [196, 61, 79],
+    [220, 81, 59], [237, 105, 37], [248, 133, 15], [252, 165, 10],
+    [248, 196, 33], [241, 226, 85], [243, 244, 132], [249, 251, 152],
+    [252, 255, 164],
+]);
+
+const CIVIDIS_LUT_256: [[u8; 3]; 256] = build_lut_256([
+    [0, 32, 76], [0, 44, 105], [27, 56, 110], [55, 69, 108],
+    [77, 83, 107], [97, 98, 110], [116, 114, 115], [134, 131, 120],
+    [154, 147, 120], [174, 163, 114], [195, 179, 102], [216, 196, 87],
+    [237, 213, 68], [250, 222, 54], [253, 228, 48], [254, 231, 51],
+    [254, 232, 56],
+]);
+
+const GRAYSCALE_LUT_256: [[u8; 3]; 256] = build_lut_256([
+    [246, 247, 249], [231, 233, 236], [216, 218, 223], [200, 203, 209],
+    [184, 188, 195], [168, 172, 180], [151, 156, 165], [135, 140, 150],
+    [118, 124, 134], [102, 107, 118], [86, 91, 101], [71, 75, 85],
+    [56, 60, 69], [43, 47, 54], [30, 33, 39], [19, 22, 26],
+    [10, 12, 16],
+]);
+
 impl ColormapPalette {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::MagmaBio,
         Self::ViridisField,
         Self::InfernoContrast,
+        Self::CividisUniform,
         Self::GrayscalePublication,
     ];
 
     pub fn label(self) -> &'static str {
         match self {
-            Self::MagmaBio => "Magma (Dark Nocturnal)",
-            Self::ViridisField => "Viridis (Perceptual Uniform)",
-            Self::InfernoContrast => "Inferno (High Ultrasonic SNR)",
-            Self::GrayscalePublication => "Inverted Grayscale (Print)",
+            Self::MagmaBio => "Magma (256-LUT Dark Nocturnal)",
+            Self::ViridisField => "Viridis (256-LUT Perceptual Uniform)",
+            Self::InfernoContrast => "Inferno (256-LUT High Ultrasonic SNR)",
+            Self::CividisUniform => "Cividis (256-LUT Colorblind Safe)",
+            Self::GrayscalePublication => "Inverted Grayscale (256-LUT Print)",
+        }
+    }
+
+    pub fn lut_256(&self) -> &'static [[u8; 3]; 256] {
+        match self {
+            Self::MagmaBio => &MAGMA_LUT_256,
+            Self::ViridisField => &VIRIDIS_LUT_256,
+            Self::InfernoContrast => &INFERNO_LUT_256,
+            Self::CividisUniform => &CIVIDIS_LUT_256,
+            Self::GrayscalePublication => &GRAYSCALE_LUT_256,
         }
     }
 
     pub fn map_unit(self, t_raw: f32) -> Color32 {
-        let t = t_raw.clamp(0.0, 1.0);
-        let stops: [(f32, [u8; 3]); 5] = match self {
-            Self::MagmaBio => [
-                (0.00, [8, 7, 24]),
-                (0.28, [66, 20, 104]),
-                (0.55, [158, 47, 100]),
-                (0.80, [238, 118, 52]),
-                (1.00, [252, 250, 191]),
-            ],
-            Self::ViridisField => [
-                (0.00, [18, 12, 46]),
-                (0.28, [49, 82, 139]),
-                (0.55, [33, 145, 140]),
-                (0.80, [94, 201, 98]),
-                (1.00, [253, 231, 37]),
-            ],
-            Self::InfernoContrast => [
-                (0.00, [6, 5, 18]),
-                (0.28, [87, 16, 110]),
-                (0.55, [188, 55, 84]),
-                (0.80, [249, 142, 9]),
-                (1.00, [252, 255, 164]),
-            ],
-            Self::GrayscalePublication => [
-                (0.00, [246, 247, 249]),
-                (0.30, [195, 198, 204]),
-                (0.60, [118, 124, 134]),
-                (0.85, [48, 52, 60]),
-                (1.00, [10, 12, 16]),
-            ],
-        };
-
-        for pair in stops.windows(2) {
-            let (t0, c0) = pair[0];
-            let (t1, c1) = pair[1];
-            if t <= t1 {
-                let u = ((t - t0) / (t1 - t0).max(1e-6)).clamp(0.0, 1.0);
-                let r = (c0[0] as f32 + u * (c1[0] as f32 - c0[0] as f32)).round() as u8;
-                let g = (c0[1] as f32 + u * (c1[1] as f32 - c0[1] as f32)).round() as u8;
-                let b = (c0[2] as f32 + u * (c1[2] as f32 - c0[2] as f32)).round() as u8;
-                return Color32::from_rgb(r, g, b);
-            }
-        }
-        Color32::WHITE
+        let idx = (t_raw.clamp(0.0, 1.0) * 255.0).round() as usize;
+        let [r, g, b] = self.lut_256()[idx.min(255)];
+        Color32::from_rgb(r, g, b)
     }
 }
 
@@ -344,6 +375,10 @@ pub struct SonoWingApp {
     pub show_zc_overlay: bool,
     pub show_call_boxes: bool,
     pub show_tkeo_overlay: bool,
+    pub log_freq_axis: bool,
+    pub caliper_start: Option<(f64, f64)>,
+    pub caliper_end: Option<(f64, f64)>,
+    caliper_dragging: bool,
     pub cursor_frame: usize,
     pub selected_call_idx: Option<usize>,
 
@@ -487,6 +522,10 @@ impl SonoWingApp {
             show_zc_overlay: false,
             show_call_boxes: true,
             show_tkeo_overlay: true,
+            log_freq_axis: false,
+            caliper_start: None,
+            caliper_end: None,
+            caliper_dragging: false,
             cursor_frame: 0,
             selected_call_idx: None,
             audio_player: UltrasonicAudioPlayer::new(),
@@ -759,37 +798,141 @@ impl SonoWingApp {
         (raw.round() as isize).clamp(0, (self.spectrogram.num_frames - 1) as isize) as usize
     }
 
+    fn log_freq_bounds(&self) -> (f64, f64) {
+        let f_lo = self.freq_min_khz.max(0.25);
+        let f_hi = self.freq_max_khz.max(f_lo + 0.5);
+        (f_lo, f_hi)
+    }
+
+    fn freq_to_norm_y(&self, f_khz: f64) -> f32 {
+        if self.log_freq_axis {
+            let (f_lo, f_hi) = self.log_freq_bounds();
+            let ln_lo = f_lo.ln();
+            let ln_hi = f_hi.ln();
+            let v = (f_khz.max(f_lo).ln() - ln_lo) / (ln_hi - ln_lo).max(1e-6);
+            v as f32
+        } else {
+            let f_span = (self.freq_max_khz - self.freq_min_khz).max(0.2);
+            ((f_khz - self.freq_min_khz) / f_span) as f32
+        }
+    }
+
+    fn norm_y_to_freq(&self, v_frac: f64) -> f64 {
+        let v = v_frac.clamp(0.0, 1.0);
+        if self.log_freq_axis {
+            let (f_lo, f_hi) = self.log_freq_bounds();
+            (f_lo.ln() + v * (f_hi.ln() - f_lo.ln())).exp()
+        } else {
+            let f_span = (self.freq_max_khz - self.freq_min_khz).max(0.2);
+            self.freq_min_khz + v * f_span
+        }
+    }
+
+    pub fn caliper_summary(&self) -> Option<(f64, f64, f64, f64, f64, f32)> {
+        let (t0, f0) = self.caliper_start?;
+        let (t1, f1) = self.caliper_end?;
+        let dt_ms = (t1 - t0).abs() * 1000.0;
+        let t_lo = t0.min(t1);
+        let t_hi = t0.max(t1);
+        let f_lo = f0.min(f1);
+        let f_hi = f0.max(f1);
+        if dt_ms < 0.05 || (f_hi - f_lo) < 0.05 {
+            return None;
+        }
+        let signed_dt_ms = (t1 - t0) * 1000.0;
+        let slope_khz_per_ms = if signed_dt_ms.abs() > 1e-6 {
+            (f1 - f0) / signed_dt_ms
+        } else {
+            0.0
+        };
+        let fr0 = self.time_to_frame(t_lo);
+        let fr1 = self.time_to_frame(t_hi).max(fr0).min(self.spectrogram.num_frames.saturating_sub(1));
+        let b0 = self.spectrogram.freq_to_bin(f_lo * 1000.0);
+        let b1 = self.spectrogram.freq_to_bin(f_hi * 1000.0).max(b0).min(self.spectrogram.num_bins.saturating_sub(1));
+        let mut peak_db = self.stft_cfg.min_dbfs;
+        for fr in fr0..=fr1 {
+            for b in b0..=b1 {
+                peak_db = peak_db.max(self.spectrogram.db_at(fr, b));
+            }
+        }
+        Some((dt_ms, f_lo, f_hi, slope_khz_per_ms, t_hi - t_lo, peak_db))
+    }
+
+    fn center_view_on_selected_call(&mut self) {
+        let Some(idx) = self.selected_call_idx else {
+            return;
+        };
+        let Some(ev) = self.detected_calls.get(idx).cloned() else {
+            return;
+        };
+        let dur_s = self.raw_recording.duration_s().max(0.05);
+        let span = (self.view_end_s - self.view_start_s).clamp(0.005_f64.min(dur_s), dur_s);
+        let mid_t = 0.5 * (ev.begin_time_s + ev.end_time_s);
+        self.cursor_frame = self.time_to_frame(mid_t);
+        if span < dur_s - 1e-6 {
+            let mut ns = mid_t - 0.5 * span;
+            let mut ne = ns + span;
+            if ns < 0.0 {
+                ne -= ns;
+                ns = 0.0;
+            }
+            if ne > dur_s {
+                ns = (ns - (ne - dur_s)).max(0.0);
+                ne = dur_s;
+            }
+            self.view_start_s = ns;
+            self.view_end_s = ne;
+            self.spec_dirty = true;
+        }
+        self.status_banner = format!(
+            "Selected Call #{} ({}, Fc {:.2} kHz, {:.1} ms)",
+            ev.id,
+            ev.primary_code(),
+            ev.f_char_khz,
+            ev.duration_ms
+        );
+    }
+
     fn rebuild_spectrogram_texture(&mut self, ctx: &egui::Context) {
         let tex_w = self.spectrogram.num_frames.clamp(1, 2048);
         let tex_h = self.spectrogram.num_bins.clamp(1, 1024);
-
-        let b_min = self.spectrogram.freq_to_bin(self.freq_min_khz * 1000.0);
-        let b_max = self
-            .spectrogram
-            .freq_to_bin(self.freq_max_khz * 1000.0)
-            .max(b_min + 1);
 
         let f_min = self.time_to_frame(self.view_start_s);
         let f_max = self
             .time_to_frame(self.view_end_s)
             .max(f_min + 1)
             .min(self.spectrogram.num_frames);
+        let frame_span = (f_max - f_min).max(1);
 
         let mut pixels = vec![Color32::BLACK; tex_w * tex_h];
         let ceil_db = -6.0 + self.gain_offset_db;
         let floor_db = ceil_db - self.dynamic_range_db.max(18.0);
 
         for row in 0..tex_h {
-            let v_frac = 1.0 - (row as f64 / (tex_h.saturating_sub(1).max(1) as f64));
-            let bin = b_min + ((v_frac * (b_max - b_min) as f64).round() as usize);
-            let bin_clamped = bin.min(self.spectrogram.num_bins - 1);
+            let v_top = 1.0 - (row as f64 / tex_h as f64);
+            let v_bot = 1.0 - ((row + 1) as f64 / tex_h as f64);
+            let f_lo = self.norm_y_to_freq(v_bot.min(v_top)) * 1000.0;
+            let f_hi = self.norm_y_to_freq(v_bot.max(v_top)) * 1000.0;
+            let bin0 = self.spectrogram.freq_to_bin(f_lo);
+            let bin1 = self
+                .spectrogram
+                .freq_to_bin(f_hi)
+                .max(bin0)
+                .min(self.spectrogram.num_bins.saturating_sub(1));
 
             for col in 0..tex_w {
-                let u_frac = col as f64 / (tex_w.saturating_sub(1).max(1) as f64);
-                let fr = f_min + ((u_frac * (f_max - f_min) as f64).floor() as usize);
-                let fr_clamped = fr.min(self.spectrogram.num_frames - 1);
-                let db = self.spectrogram.db_at(fr_clamped, bin_clamped);
-                let unit = (db - floor_db) / (ceil_db - floor_db).max(1.0);
+                let fr0 = (f_min + (col * frame_span) / tex_w).min(self.spectrogram.num_frames - 1);
+                let fr1 = (f_min + ((col + 1) * frame_span) / tex_w)
+                    .saturating_sub(1)
+                    .max(fr0)
+                    .min(f_max - 1);
+                let mut max_db = self.stft_cfg.min_dbfs;
+                for fr in fr0..=fr1 {
+                    for bin in bin0..=bin1 {
+                        max_db = max_db.max(self.spectrogram.db_at(fr, bin));
+                    }
+                }
+                let unit = (max_db - floor_db) / (ceil_db - floor_db).max(1.0);
                 pixels[row * tex_w + col] = self.palette.map_unit(unit);
             }
         }
@@ -1093,13 +1236,33 @@ impl SonoWingApp {
         }
 
         let wants_kb = ctx.wants_keyboard_input();
-        let (esc_pressed, space_pressed, f1_pressed, f5_pressed, f9_pressed) = ctx.input(|i| {
+        let (
+            esc_pressed,
+            space_pressed,
+            f1_pressed,
+            f5_pressed,
+            f9_pressed,
+            left_pressed,
+            right_pressed,
+            zero_pressed,
+            z_pressed,
+            num1_pressed,
+            num2_pressed,
+            num3_pressed,
+        ) = ctx.input(|i| {
             (
                 i.key_pressed(egui::Key::Escape),
                 i.key_pressed(egui::Key::Space),
                 i.key_pressed(egui::Key::F1),
                 i.key_pressed(egui::Key::F5),
                 i.key_pressed(egui::Key::F9),
+                i.key_pressed(egui::Key::ArrowLeft),
+                i.key_pressed(egui::Key::ArrowRight),
+                i.key_pressed(egui::Key::Num0),
+                i.key_pressed(egui::Key::Z),
+                i.key_pressed(egui::Key::Num1),
+                i.key_pressed(egui::Key::Num2),
+                i.key_pressed(egui::Key::Num3),
             )
         });
 
@@ -1110,6 +1273,10 @@ impl SonoWingApp {
                 self.show_reference_modal = false;
             } else if self.show_sessions_modal {
                 self.show_sessions_modal = false;
+            } else if self.caliper_start.is_some() || self.caliper_end.is_some() {
+                self.caliper_start = None;
+                self.caliper_end = None;
+                self.caliper_dragging = false;
             }
         }
         if f1_pressed {
@@ -1124,20 +1291,52 @@ impl SonoWingApp {
         }
         let any_modal_open =
             self.show_about_modal || self.show_reference_modal || self.show_sessions_modal;
-        if space_pressed
-            && self.stage == AppStage::Workstation
-            && !any_modal_open
-            && !wants_kb
-        {
-            if self.audio_player.is_playing() {
-                self.audio_player.pause_or_resume();
-                self.status_banner = if self.audio_player.is_paused() {
-                    "Paused audible playback.".to_string()
+        if self.stage == AppStage::Workstation && !any_modal_open && !wants_kb {
+            if space_pressed {
+                if self.audio_player.is_playing() {
+                    self.audio_player.pause_or_resume();
+                    self.status_banner = if self.audio_player.is_paused() {
+                        "Paused audible playback.".to_string()
+                    } else {
+                        "Resumed audible playback.".to_string()
+                    };
                 } else {
-                    "Resumed audible playback.".to_string()
+                    self.start_audio_playback(self.audition_mode);
+                }
+            }
+            if zero_pressed || z_pressed {
+                let dur_s = self.raw_recording.duration_s().max(0.05);
+                let nyq_khz = (self.raw_recording.nyquist_hz() * 0.001).max(1.0);
+                self.view_start_s = 0.0;
+                self.view_end_s = dur_s;
+                self.freq_min_khz = 0.0;
+                self.freq_max_khz = nyq_khz;
+                self.spec_dirty = true;
+                self.status_banner = "Reset spectrogram & waveform zoom.".to_string();
+            }
+            if num1_pressed {
+                self.audition_mode = AuditionMode::TimeExpansion10x;
+                self.status_banner = format!("Audition mode: {}", self.audition_mode.label());
+            }
+            if num2_pressed {
+                self.audition_mode = AuditionMode::TimeExpansion20x;
+                self.status_banner = format!("Audition mode: {}", self.audition_mode.label());
+            }
+            if num3_pressed {
+                self.audition_mode = AuditionMode::Heterodyne {
+                    carrier_khz: self.heterodyne_carrier_khz,
                 };
-            } else {
-                self.start_audio_playback(self.audition_mode);
+                self.status_banner = format!("Audition mode: {}", self.audition_mode.label());
+            }
+            if (left_pressed || right_pressed) && !self.detected_calls.is_empty() {
+                let len = self.detected_calls.len();
+                let next_idx = match self.selected_call_idx {
+                    Some(cur) if left_pressed => cur.saturating_sub(1),
+                    Some(cur) if right_pressed => (cur + 1).min(len - 1),
+                    _ => 0,
+                };
+                self.selected_call_idx = Some(next_idx);
+                self.center_view_on_selected_call();
             }
         }
 
@@ -2249,6 +2448,42 @@ impl SonoWingApp {
                     ui.separator();
                     ui.strong("STFT Spectrogram Engine");
                     let mut dsp_changed = false;
+                    ui.horizontal_wrapped(|ui| {
+                        ui.small("Presets:");
+                        if ui
+                            .small_button("Bat FM 512/64")
+                            .on_hover_text("High time-resolution 512-pt Blackman-Harris STFT (64-samp hop) for steep FM bat sweeps")
+                            .clicked()
+                        {
+                            self.stft_cfg.fft_size = 512;
+                            self.stft_cfg.hop_size = 64;
+                            self.stft_cfg.window = WindowFunction::BlackmanHarris4;
+                            self.detector_cfg.mode = DetectionMode::BatUltrasonicOnly;
+                            dsp_changed = true;
+                        }
+                        if ui
+                            .small_button("Bat CF 2048/128")
+                            .on_hover_text("High frequency-resolution 2048-pt Blackman-Harris STFT (128-samp hop) for CF/FM-CF-FM calls")
+                            .clicked()
+                        {
+                            self.stft_cfg.fft_size = 2048;
+                            self.stft_cfg.hop_size = 128;
+                            self.stft_cfg.window = WindowFunction::BlackmanHarris4;
+                            self.detector_cfg.mode = DetectionMode::BatUltrasonicOnly;
+                            dsp_changed = true;
+                        }
+                        if ui
+                            .small_button("Avian NFC 1024/256")
+                            .on_hover_text("Balanced 1024-pt Hann STFT (256-samp hop) tuned for audible nocturnal flight calls & song")
+                            .clicked()
+                        {
+                            self.stft_cfg.fft_size = 1024;
+                            self.stft_cfg.hop_size = 256;
+                            self.stft_cfg.window = WindowFunction::Hann;
+                            self.detector_cfg.mode = DetectionMode::BirdAudibleOnly;
+                            dsp_changed = true;
+                        }
+                    });
 
                     egui::ComboBox::from_label("FFT Size")
                         .selected_text(format!("{} pts", self.stft_cfg.fft_size))
@@ -2445,6 +2680,13 @@ impl SonoWingApp {
                         .changed();
 
                     if view_changed {
+                        self.spec_dirty = true;
+                    }
+                    if ui
+                        .checkbox(&mut self.log_freq_axis, "Logarithmic Frequency Axis (Log-kHz)")
+                        .on_hover_text("Plot spectrogram frequency on a logarithmic kHz scale (0.25 kHz floor) to resolve low-frequency avian harmonics alongside bat ultrasound")
+                        .changed()
+                    {
                         self.spec_dirty = true;
                     }
 
@@ -3607,12 +3849,48 @@ impl SonoWingApp {
                     }
                 }
                 bar.separator();
-                if bar.button("Reset Zoom").clicked() {
+                if bar
+                    .button("Reset Zoom (Z)")
+                    .on_hover_text("Reset full recording time & Nyquist frequency zoom (Hotkeys: 0 or Z)")
+                    .clicked()
+                {
                     self.view_start_s = 0.0;
                     self.view_end_s = dur_s;
                     self.freq_min_khz = 0.0;
                     self.freq_max_khz = nyq_khz;
                     self.spec_dirty = true;
+                }
+                if bar
+                    .checkbox(&mut self.log_freq_axis, "Log kHz")
+                    .on_hover_text("Toggle logarithmic kHz Y-axis scaling")
+                    .changed()
+                {
+                    self.spec_dirty = true;
+                }
+                if let Some((dt_ms, f_lo, f_hi, slope, _, peak_db)) = self.caliper_summary() {
+                    bar.separator();
+                    bar.small(format!(
+                        "Caliper: {dt_ms:.1} ms | {f_lo:.1}-{f_hi:.1} kHz | {slope:+.2} kHz/ms | {peak_db:.1} dBFS"
+                    ));
+                    if bar
+                        .button("Apply Bandpass to Selection")
+                        .on_hover_text("Filter recording with 4th-order zero-phase Butterworth bandpass matching caliper bounds")
+                        .clicked()
+                    {
+                        self.bandpass_low_khz = f_lo.clamp(0.2, nyq_khz * 0.9);
+                        self.bandpass_high_khz = f_hi.clamp(self.bandpass_low_khz + 0.5, nyq_khz * 0.98);
+                        self.apply_bandpass = true;
+                        self.recompute_full_pipeline(false);
+                        self.status_banner = format!(
+                            "Applied zero-phase bandpass {:.1}-{:.1} kHz from caliper selection.",
+                            self.bandpass_low_khz, self.bandpass_high_khz
+                        );
+                    }
+                    if bar.small_button("Clear").clicked() {
+                        self.caliper_start = None;
+                        self.caliper_end = None;
+                        self.caliper_dragging = false;
+                    }
                 }
                 let win_lbl = if t_span <= 2.0 {
                     format!(
@@ -3637,7 +3915,7 @@ impl SonoWingApp {
 
             let avail = ui.available_size();
             let y_axis_w = 58.0_f32;
-            let right_pad = 14.0_f32;
+            let right_pad = 58.0_f32;
             let x_axis_h = 24.0_f32;
 
             let wave_h = (avail.y * 0.26).clamp(88.0, 196.0);
@@ -3792,24 +4070,59 @@ impl SonoWingApp {
                 self.spec_dirty = true;
             }
 
-            // Left-click / left-drag moves cursor playhead and selects call
-            for (plot_rect, resp) in [(wave_plot_rect, &wave_resp), (spec_plot_rect, &spec_resp)] {
-                if resp.clicked_by(egui::PointerButton::Primary)
-                    || resp.dragged_by(egui::PointerButton::Primary)
-                {
-                    if let Some(pos) = resp.interact_pointer_pos() {
-                        let u = ((pos.x - plot_rect.left()) / plot_rect.width().max(1.0))
-                            .clamp(0.0, 1.0);
-                        let t_click =
-                            self.view_start_s + (u as f64) * (self.view_end_s - self.view_start_s);
-                        self.cursor_frame = self.time_to_frame(t_click);
-                        if let Some((idx, _)) = self
-                            .detected_calls
-                            .iter()
-                            .enumerate()
-                            .find(|(_, ev)| t_click >= ev.begin_time_s && t_click <= ev.end_time_s)
+            // Shift+Drag spectrogram caliper vs. left-click/drag playhead & call selection
+            let shift_down_now = ctx.input(|i| i.modifiers.shift);
+            if shift_down_now && spec_resp.drag_started_by(egui::PointerButton::Primary) {
+                if let Some(pos) = spec_resp.interact_pointer_pos() {
+                    let u = ((pos.x - spec_plot_rect.left()) / spec_plot_rect.width().max(1.0))
+                        .clamp(0.0, 1.0) as f64;
+                    let v = 1.0
+                        - ((pos.y - spec_plot_rect.top()) / spec_plot_rect.height().max(1.0))
+                            .clamp(0.0, 1.0) as f64;
+                    let pt = (
+                        self.view_start_s + u * (self.view_end_s - self.view_start_s),
+                        self.norm_y_to_freq(v),
+                    );
+                    self.caliper_start = Some(pt);
+                    self.caliper_end = Some(pt);
+                    self.caliper_dragging = true;
+                }
+            } else if self.caliper_dragging && spec_resp.dragged_by(egui::PointerButton::Primary) {
+                if let Some(pos) = spec_resp.interact_pointer_pos() {
+                    let u = ((pos.x - spec_plot_rect.left()) / spec_plot_rect.width().max(1.0))
+                        .clamp(0.0, 1.0) as f64;
+                    let v = 1.0
+                        - ((pos.y - spec_plot_rect.top()) / spec_plot_rect.height().max(1.0))
+                            .clamp(0.0, 1.0) as f64;
+                    self.caliper_end = Some((
+                        self.view_start_s + u * (self.view_end_s - self.view_start_s),
+                        self.norm_y_to_freq(v),
+                    ));
+                }
+            } else {
+                if self.caliper_dragging && spec_resp.drag_stopped_by(egui::PointerButton::Primary) {
+                    self.caliper_dragging = false;
+                }
+                if !shift_down_now {
+                    for (plot_rect, resp) in [(wave_plot_rect, &wave_resp), (spec_plot_rect, &spec_resp)] {
+                        if resp.clicked_by(egui::PointerButton::Primary)
+                            || resp.dragged_by(egui::PointerButton::Primary)
                         {
-                            self.selected_call_idx = Some(idx);
+                            if let Some(pos) = resp.interact_pointer_pos() {
+                                let u = ((pos.x - plot_rect.left()) / plot_rect.width().max(1.0))
+                                    .clamp(0.0, 1.0);
+                                let t_click =
+                                    self.view_start_s + (u as f64) * (self.view_end_s - self.view_start_s);
+                                self.cursor_frame = self.time_to_frame(t_click);
+                                if let Some((idx, _)) = self
+                                    .detected_calls
+                                    .iter()
+                                    .enumerate()
+                                    .find(|(_, ev)| t_click >= ev.begin_time_s && t_click <= ev.end_time_s)
+                                {
+                                    self.selected_call_idx = Some(idx);
+                                }
+                            }
                         }
                     }
                 }
@@ -3964,7 +4277,7 @@ impl SonoWingApp {
         let t_span = (self.view_end_s - self.view_start_s).max(1e-5);
         let f_span = (self.freq_max_khz - self.freq_min_khz).max(0.2);
 
-        // Clean kHz Y-axis ticks & labels in left gutter
+        // Clean kHz Y-axis ticks & labels in left gutter (Linear or Log-kHz)
         let axis_col = Color32::from_rgb(176, 194, 218);
         let grid_stroke = Stroke::new(0.7_f32, Color32::from_rgba_unmultiplied(200, 215, 235, 34));
         let tick_stroke = Stroke::new(1.0_f32, Color32::from_rgb(122, 142, 168));
@@ -3972,14 +4285,22 @@ impl SonoWingApp {
         outer_painter.text(
             Pos2::new(rect.left() - 6.0, rect.top() + 2.0),
             egui::Align2::RIGHT_TOP,
-            "kHz",
+            if self.log_freq_axis { "kHz(lg)" } else { "kHz" },
             FontId::monospace(10.0),
             Color32::from_rgb(132, 214, 200),
         );
-        let y_ticks = nice_axis_ticks(self.freq_min_khz, self.freq_max_khz, 7);
+        let y_ticks: Vec<f64> = if self.log_freq_axis {
+            let (f_lo, f_hi) = self.log_freq_bounds();
+            [0.25, 0.5, 1.0, 2.0, 4.0, 8.0, 12.0, 20.0, 30.0, 50.0, 80.0, 120.0, 180.0]
+                .into_iter()
+                .filter(|&f| f >= f_lo && f <= f_hi)
+                .collect()
+        } else {
+            nice_axis_ticks(self.freq_min_khz, self.freq_max_khz, 7)
+        };
         let mut last_y_lbl = f32::INFINITY;
         for fk in y_ticks {
-            let frac = ((fk - self.freq_min_khz) / f_span) as f32;
+            let frac = self.freq_to_norm_y(fk);
             if !(-0.001..=1.001).contains(&frac) {
                 continue;
             }
@@ -3989,9 +4310,8 @@ impl SonoWingApp {
                 [Pos2::new(rect.left() - 4.0, y), Pos2::new(rect.left(), y)],
                 tick_stroke,
             );
-            // Leave room near top for "kHz" unit label and avoid overlapping adjacent labels
             if (last_y_lbl - y).abs() >= 18.0 && y >= rect.top() + 14.0 {
-                let lbl = if f_span < 5.0 {
+                let lbl = if fk < 2.0 || (!self.log_freq_axis && f_span < 5.0) {
                     format!("{fk:.1}")
                 } else {
                     format!("{fk:.0}")
@@ -4005,6 +4325,53 @@ impl SonoWingApp {
                 );
                 last_y_lbl = y;
             }
+        }
+
+        // Vertical dBFS Colorbar Legend in right gutter
+        let cb_x0 = rect.right() + 8.0;
+        let cb_w = 12.0_f32;
+        if outer_rect.right() >= cb_x0 + cb_w + 20.0 {
+            let strips = 48usize;
+            let strip_h = rect.height() / strips as f32;
+            for i in 0..strips {
+                let unit = 1.0 - (i as f32 + 0.5) / strips as f32;
+                let y0 = rect.top() + i as f32 * strip_h;
+                let sr = Rect::from_min_max(
+                    Pos2::new(cb_x0, y0),
+                    Pos2::new(cb_x0 + cb_w, (y0 + strip_h + 0.5).min(rect.bottom())),
+                );
+                outer_painter.rect_filled(sr, CornerRadius::ZERO, self.palette.map_unit(unit));
+            }
+            outer_painter.rect_stroke(
+                Rect::from_min_max(Pos2::new(cb_x0, rect.top()), Pos2::new(cb_x0 + cb_w, rect.bottom())),
+                CornerRadius::ZERO,
+                tick_stroke,
+                StrokeKind::Outside,
+            );
+            let ceil_db = -6.0 + self.gain_offset_db;
+            let floor_db = ceil_db - self.dynamic_range_db.max(18.0);
+            let mid_db = 0.5 * (ceil_db + floor_db);
+            outer_painter.text(
+                Pos2::new(cb_x0 + cb_w + 4.0, rect.top()),
+                egui::Align2::LEFT_TOP,
+                format!("{ceil_db:.0}"),
+                FontId::monospace(9.0),
+                axis_col,
+            );
+            outer_painter.text(
+                Pos2::new(cb_x0 + cb_w + 4.0, rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                format!("{mid_db:.0}"),
+                FontId::monospace(9.0),
+                axis_col,
+            );
+            outer_painter.text(
+                Pos2::new(cb_x0 + cb_w + 4.0, rect.bottom()),
+                egui::Align2::LEFT_BOTTOM,
+                format!("{floor_db:.0}dB"),
+                FontId::monospace(9.0),
+                axis_col,
+            );
         }
 
         // Clean ms / s X-axis ticks & labels in bottom gutter
@@ -4062,7 +4429,7 @@ impl SonoWingApp {
                     continue;
                 }
                 let x = rect.left() + ((d.time_s - self.view_start_s) / t_span) as f32 * rect.width();
-                let y = rect.bottom() - ((fk - self.freq_min_khz) / f_span) as f32 * rect.height();
+                let y = rect.bottom() - self.freq_to_norm_y(fk).clamp(0.0, 1.0) * rect.height();
                 painter.circle_filled(Pos2::new(x, y), 2.0, Color32::from_rgb(95, 250, 165));
             }
         }
@@ -4080,10 +4447,10 @@ impl SonoWingApp {
                         + (((ev.end_time_s - self.view_start_s) / t_span) as f32 * rect.width())
                             .clamp(0.0, rect.width());
                     let y_hi = rect.bottom()
-                        - (((ev.f_max_khz - self.freq_min_khz) / f_span) as f32 * rect.height())
+                        - (self.freq_to_norm_y(ev.f_max_khz) * rect.height())
                             .clamp(0.0, rect.height());
                     let y_lo = rect.bottom()
-                        - (((ev.f_min_khz - self.freq_min_khz) / f_span) as f32 * rect.height())
+                        - (self.freq_to_norm_y(ev.f_min_khz) * rect.height())
                             .clamp(0.0, rect.height());
 
                     let box_color = match ev.phase {
@@ -4134,11 +4501,11 @@ impl SonoWingApp {
                             let px0 = rect.left()
                                 + ((t0 - self.view_start_s) / t_span) as f32 * rect.width();
                             let py0 = rect.bottom()
-                                - ((f0 - self.freq_min_khz) / f_span) as f32 * rect.height();
+                                - self.freq_to_norm_y(f0).clamp(0.0, 1.0) * rect.height();
                             let px1 = rect.left()
                                 + ((t1 - self.view_start_s) / t_span) as f32 * rect.width();
                             let py1 = rect.bottom()
-                                - ((f1 - self.freq_min_khz) / f_span) as f32 * rect.height();
+                                - self.freq_to_norm_y(f1).clamp(0.0, 1.0) * rect.height();
                             painter.line_segment(
                                 [Pos2::new(px0, py0), Pos2::new(px1, py1)],
                                 Stroke::new(1.8_f32, Color32::from_rgb(120, 255, 235)),
@@ -4167,11 +4534,11 @@ impl SonoWingApp {
                                 let px0 = rect.left()
                                     + ((t0 - self.view_start_s) / t_span) as f32 * rect.width();
                                 let py0 = rect.bottom()
-                                    - ((f0 - self.freq_min_khz) / f_span) as f32 * rect.height();
+                                    - self.freq_to_norm_y(f0).clamp(0.0, 1.0) * rect.height();
                                 let px1 = rect.left()
                                     + ((t1 - self.view_start_s) / t_span) as f32 * rect.width();
                                 let py1 = rect.bottom()
-                                    - ((f1 - self.freq_min_khz) / f_span) as f32 * rect.height();
+                                    - self.freq_to_norm_y(f1).clamp(0.0, 1.0) * rect.height();
                                 painter.line_segment(
                                     [Pos2::new(px0, py0), Pos2::new(px1, py1)],
                                     Stroke::new(1.3_f32, h_col),
@@ -4192,12 +4559,52 @@ impl SonoWingApp {
             );
         }
 
+        if let (Some((t0, f0)), Some((t1, f1))) = (self.caliper_start, self.caliper_end) {
+            let x0 = rect.left() + (((t0 - self.view_start_s) / t_span) as f32 * rect.width()).clamp(0.0, rect.width());
+            let y0 = rect.bottom() - self.freq_to_norm_y(f0).clamp(0.0, 1.0) * rect.height();
+            let x1 = rect.left() + (((t1 - self.view_start_s) / t_span) as f32 * rect.width()).clamp(0.0, rect.width());
+            let y1 = rect.bottom() - self.freq_to_norm_y(f1).clamp(0.0, 1.0) * rect.height();
+            let cal_rect = Rect::from_min_max(
+                Pos2::new(x0.min(x1), y0.min(y1)),
+                Pos2::new(x0.max(x1), y0.max(y1)),
+            );
+            painter.rect_filled(
+                cal_rect,
+                CornerRadius::ZERO,
+                Color32::from_rgba_unmultiplied(80, 220, 255, 28),
+            );
+            painter.rect_stroke(
+                cal_rect,
+                CornerRadius::ZERO,
+                Stroke::new(1.5_f32, Color32::from_rgb(95, 235, 255)),
+                StrokeKind::Inside,
+            );
+            painter.line_segment(
+                [Pos2::new(x0, y0), Pos2::new(x1, y1)],
+                Stroke::new(1.5_f32, Color32::from_rgb(255, 210, 90)),
+            );
+            if let Some((dt_ms, f_lo, f_hi, slope, _, peak_db)) = self.caliper_summary() {
+                let cal_lbl = format!(
+                    "dt={dt_ms:.1}ms | {f_lo:.1}-{f_hi:.1}kHz | {slope:+.2}kHz/ms | pk={peak_db:.1}dBFS"
+                );
+                let tx = (cal_rect.left() + 4.0).min((rect.right() - 280.0).max(rect.left() + 4.0));
+                let ty = (cal_rect.top() - 16.0).max(rect.top() + 4.0);
+                painter.text(
+                    Pos2::new(tx, ty),
+                    egui::Align2::LEFT_TOP,
+                    cal_lbl,
+                    FontId::monospace(10.0),
+                    Color32::from_rgb(130, 245, 255),
+                );
+            }
+        }
+
         if let Some(hpos) = resp.hover_pos() {
             if rect.contains(hpos) {
                 let u = ((hpos.x - rect.left()) / rect.width().max(1.0)).clamp(0.0, 1.0);
                 let v = 1.0 - ((hpos.y - rect.top()) / rect.height().max(1.0)).clamp(0.0, 1.0);
                 let ht_s = self.view_start_s + (u as f64) * t_span;
-                let hf_khz = self.freq_min_khz + (v as f64) * f_span;
+                let hf_khz = self.norm_y_to_freq(v as f64);
                 let fr = self.time_to_frame(ht_s);
                 let bin = self.spectrogram.freq_to_bin(hf_khz * 1000.0);
                 let db = self.spectrogram.db_at(fr, bin);
@@ -4323,7 +4730,7 @@ impl SonoWingApp {
             .open(&mut open)
             .default_width(780.0)
             .show(ctx, |ui| {
-                ui.label("Shortcuts: Space = Play/Pause Audition | Esc = Close Modal | F1 = Reference Key | F5 = Save SQLite WAL Session | F9 = Load SQLite Session | Drag & Drop .wav/.zc onto window");
+                ui.label("Shortcuts: Space = Play/Pause | Left/Right = Step Calls | 0 / Z = Reset Zoom | 1-3 = Audition Mode (TE10x/TE20x/Het) | Shift+Drag = Caliper | Esc = Close/Clear | F1 = Key | F5/F9 = Save/Load SQLite");
                 ui.separator();
                 egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
                     egui::Grid::new("ref_species_modal_grid")
@@ -4629,6 +5036,87 @@ mod tests {
         let _ = run_frame(&ctx, &mut app, vec![esc()]);
         assert!(!app.show_sessions_modal);
         assert_eq!(app.stage, AppStage::Workstation);
+
+        let _ = std::fs::remove_file(&tmp_db);
+    }
+
+    #[test]
+    fn hotkeys_caliper_log_axis_and_256_lut_palettes() {
+        let tmp_db = std::env::temp_dir().join(format!(
+            "sonowing_ux_fidelity_test_{}.sqlite3",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp_db);
+        let ctx = egui::Context::default();
+        let mut app = SonoWingApp::new_headless(&ctx, None, true, tmp_db.clone());
+        assert!(app.detected_calls.len() >= 2);
+
+        let run_frame = |ctx: &egui::Context, app: &mut SonoWingApp, events: Vec<egui::Event>| {
+            let raw = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1480.0, 920.0),
+                )),
+                events,
+                ..Default::default()
+            };
+            ctx.run(raw, |c| app.ui_step(c))
+        };
+        let key_evt = |key: egui::Key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+
+        // 1. Zoom in slightly, step calls with ArrowRight, and verify auto-centering + Z zoom reset
+        app.view_start_s = 0.0;
+        app.view_end_s = 0.05;
+        app.selected_call_idx = Some(0);
+        let _ = run_frame(&ctx, &mut app, vec![key_evt(egui::Key::ArrowRight)]);
+        assert_eq!(app.selected_call_idx, Some(1));
+        let ev1 = &app.detected_calls[1];
+        let mid1 = 0.5 * (ev1.begin_time_s + ev1.end_time_s);
+        assert!(
+            mid1 >= app.view_start_s && mid1 <= app.view_end_s,
+            "Stepped call midpoint {mid1} should be centered inside [{}, {}]",
+            app.view_start_s,
+            app.view_end_s
+        );
+
+        let _ = run_frame(&ctx, &mut app, vec![key_evt(egui::Key::Z)]);
+        assert!((app.view_start_s).abs() < 1e-6);
+        assert!((app.view_end_s - app.raw_recording.duration_s()).abs() < 1e-3);
+
+        // 2. 1-3 audition mode switching
+        let _ = run_frame(&ctx, &mut app, vec![key_evt(egui::Key::Num2)]);
+        assert_eq!(app.audition_mode, AuditionMode::TimeExpansion20x);
+        let _ = run_frame(&ctx, &mut app, vec![key_evt(egui::Key::Num3)]);
+        assert!(matches!(app.audition_mode, AuditionMode::Heterodyne { .. }));
+        let _ = run_frame(&ctx, &mut app, vec![key_evt(egui::Key::Num1)]);
+        assert_eq!(app.audition_mode, AuditionMode::TimeExpansion10x);
+
+        // 3. Shift-drag caliper measurement & Log-kHz mode & 256-entry LUT check
+        app.caliper_start = Some((0.020, 35.0));
+        app.caliper_end = Some((0.025, 55.0));
+        let (dt_ms, f_lo, f_hi, slope, _, _) = app.caliper_summary().expect("caliper summary");
+        assert!((dt_ms - 5.0).abs() < 1e-6);
+        assert!((f_lo - 35.0).abs() < 1e-6 && (f_hi - 55.0).abs() < 1e-6);
+        assert!((slope - 4.0).abs() < 1e-6);
+
+        app.log_freq_axis = true;
+        app.spec_dirty = true;
+        let out_log = run_frame(&ctx, &mut app, vec![]);
+        assert!(app.has_spec_texture());
+        assert!(!out_log.shapes.is_empty());
+
+        for pal in ColormapPalette::ALL {
+            assert_eq!(pal.lut_256().len(), 256);
+            let _ = pal.map_unit(0.0);
+            let _ = pal.map_unit(0.5);
+            let _ = pal.map_unit(1.0);
+        }
 
         let _ = std::fs::remove_file(&tmp_db);
     }

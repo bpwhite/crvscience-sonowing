@@ -107,8 +107,9 @@ pub fn render_audible_recording(
                 let x_clean = if x.is_finite() { x as f64 } else { 0.0 };
                 mixed.push((x_clean * phase.cos() * 2.0) as f32);
             }
-            // Low-pass filter difference-frequency audio band at 4.5 kHz before decimation
-            let lp = BiquadCoeffs::butterworth_lowpass(4_500.0_f64.min(0.45 * sr), sr);
+            // Low-pass filter difference-frequency audio band safely below 0.45 * out_rate before decimation
+            let lp_cutoff = 4_500.0_f64.min(0.45 * (out_rate as f64)).min(0.45 * sr);
+            let lp = BiquadCoeffs::butterworth_lowpass(lp_cutoff, sr);
             let baseband = lp.apply_zero_phase(&mixed);
             let resampled = linear_resample(&baseband, rec.sample_rate_hz.max(1_000), out_rate);
 
@@ -158,9 +159,10 @@ pub fn render_audible_recording(
                 divided[i] = sign_out * env[i];
             }
 
-            // Smooth square-wave harmonics above 9 kHz so playback sounds crisp rather than harsh
+            // Smooth square-wave harmonics safely below 0.45 * out_rate before decimation
             let sr = (rec.sample_rate_hz as f64).max(1_000.0);
-            let lp = BiquadCoeffs::butterworth_lowpass(9_000.0_f64.min(0.45 * sr), sr);
+            let lp_cutoff = 9_000.0_f64.min(0.45 * (out_rate as f64)).min(0.45 * sr);
+            let lp = BiquadCoeffs::butterworth_lowpass(lp_cutoff, sr);
             let smoothed = lp.apply_zero_phase(&divided);
             let resampled = linear_resample(&smoothed, rec.sample_rate_hz.max(1_000), out_rate);
 
@@ -203,19 +205,36 @@ fn linear_resample_f64(input: &[f32], src_rate: f64, dst_rate: f64) -> Vec<f32> 
             .map(|&x| if x.is_finite() { x } else { 0.0 })
             .collect();
     }
+    let filtered_buf;
+    let src_samples: &[f32] = if dst_rate < src_rate && input.len() >= 16 {
+        let anti_alias_hz = (0.45 * dst_rate).min(0.45 * src_rate);
+        if anti_alias_hz > 5.0 && anti_alias_hz < 0.49 * src_rate {
+            let clean: Vec<f32> = input
+                .iter()
+                .map(|&x| if x.is_finite() { x } else { 0.0 })
+                .collect();
+            filtered_buf = BiquadCoeffs::butterworth_lowpass(anti_alias_hz, src_rate)
+                .apply_zero_phase(&clean);
+            &filtered_buf
+        } else {
+            input
+        }
+    } else {
+        input
+    };
     let ratio = src_rate / dst_rate;
-    let out_len = ((input.len() as f64) / ratio).round() as usize;
+    let out_len = ((src_samples.len() as f64) / ratio).round() as usize;
     let mut out = Vec::with_capacity(out_len.max(1));
     for i in 0..out_len {
         let src_pos = i as f64 * ratio;
         let idx = src_pos.floor() as usize;
         let frac = (src_pos - idx as f64) as f32;
-        let s0 = input
+        let s0 = src_samples
             .get(idx)
             .copied()
             .filter(|v| v.is_finite())
             .unwrap_or(0.0);
-        let s1 = input
+        let s1 = src_samples
             .get(idx + 1)
             .copied()
             .filter(|v| v.is_finite())

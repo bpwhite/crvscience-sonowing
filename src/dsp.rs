@@ -265,7 +265,9 @@ pub fn compute_stft(samples: &[f32], sample_rate_hz: u32, cfg: StftConfig) -> Sp
     let num_bins = fft_size / 2 + 1;
     let win = cfg.window.generate(fft_size);
     let win_sum: f64 = win.iter().sum::<f64>().max(1e-9);
-    let scale = 2.0 / win_sum;
+    let scale_ac = 2.0 / win_sum;
+    let scale_dc_nyq = 1.0 / win_sum;
+    let nyq_bin = fft_size / 2;
 
     let num_frames = if samples.len() <= fft_size {
         1
@@ -294,7 +296,12 @@ pub fn compute_stft(samples: &[f32], sample_rate_hz: u32, cfg: StftConfig) -> Sp
             let active_bins = (num_bins - 1).max(1);
 
             for b in 0..num_bins {
-                let mag = buf[b].norm() * scale;
+                let bin_scale = if b == 0 || b == nyq_bin {
+                    scale_dc_nyq
+                } else {
+                    scale_ac
+                };
+                let mag = buf[b].norm() * bin_scale;
                 mag_row[b] = mag as f32;
                 let db = if mag <= 1e-10 {
                     cfg.min_dbfs
@@ -412,10 +419,13 @@ pub struct BiquadCoeffs {
 }
 
 impl BiquadCoeffs {
-    /// Robert Bristow-Johnson Audio EQ Cookbook 2nd-order Butterworth Low-Pass (`Q = 1/sqrt(2)`).
+    /// Robert Bristow-Johnson Audio EQ Cookbook 2nd-order Butterworth Low-Pass (`Q = 1/sqrt(2)`),
+    /// pre-warped by `1 / (sqrt(2) - 1)^(1/4)` so forward-backward `filtfilt` hits `-3.01 dB` at `cutoff_hz`.
     pub fn butterworth_lowpass(cutoff_hz: f64, sample_rate_hz: f64) -> Self {
         let fc = cutoff_hz.clamp(5.0, 0.495 * sample_rate_hz);
-        let w0 = TAU * fc / sample_rate_hz;
+        let c_warp = (2.0_f64.sqrt() - 1.0).powf(0.25);
+        let tan_half = (PI * fc / sample_rate_hz).tan() / c_warp;
+        let w0 = (2.0 * tan_half.atan()).min(TAU * 0.495);
         let cos_w0 = w0.cos();
         let alpha = w0.sin() / 2.0_f64.sqrt();
         let a0 = 1.0 + alpha;
@@ -428,10 +438,13 @@ impl BiquadCoeffs {
         }
     }
 
-    /// 2nd-order Butterworth High-Pass (`Q = 1/sqrt(2)`).
+    /// 2nd-order Butterworth High-Pass (`Q = 1/sqrt(2)`), pre-warped by `(sqrt(2) - 1)^(1/4)`
+    /// so forward-backward `filtfilt` hits `-3.01 dB` at `cutoff_hz`.
     pub fn butterworth_highpass(cutoff_hz: f64, sample_rate_hz: f64) -> Self {
         let fc = cutoff_hz.clamp(5.0, 0.495 * sample_rate_hz);
-        let w0 = TAU * fc / sample_rate_hz;
+        let c_warp = (2.0_f64.sqrt() - 1.0).powf(0.25);
+        let tan_half = (PI * fc / sample_rate_hz).tan() * c_warp;
+        let w0 = (2.0 * tan_half.atan()).max(TAU * (5.0 / sample_rate_hz));
         let cos_w0 = w0.cos();
         let alpha = w0.sin() / 2.0_f64.sqrt();
         let a0 = 1.0 + alpha;
@@ -442,6 +455,34 @@ impl BiquadCoeffs {
             a1: (-2.0 * cos_w0) / a0,
             a2: (1.0 - alpha) / a0,
         }
+    }
+
+    #[inline]
+    fn steady_state_zi(&self, x0: f64) -> (f64, f64) {
+        let denom = 1.0 + self.a1 + self.a2;
+        let y_ss = if denom.abs() > 1e-12 {
+            ((self.b0 + self.b1 + self.b2) / denom) * x0
+        } else {
+            0.0
+        };
+        let z1 = y_ss - self.b0 * x0;
+        let z2 = self.b2 * x0 - self.a2 * y_ss;
+        (z1, z2)
+    }
+
+    fn apply_forward_f64_zi(&self, input: &[f64]) -> Vec<f64> {
+        let mut out = Vec::with_capacity(input.len());
+        let Some(&x0) = input.first() else {
+            return out;
+        };
+        let (mut z1, mut z2) = self.steady_state_zi(x0);
+        for &x in input {
+            let y = self.b0 * x + z1;
+            z1 = self.b1 * x - self.a1 * y + z2;
+            z2 = self.b2 * x - self.a2 * y;
+            out.push(y);
+        }
+        out
     }
 
     pub fn apply_forward(&self, input: &[f32]) -> Vec<f32> {
@@ -458,16 +499,40 @@ impl BiquadCoeffs {
         out
     }
 
-    /// Forward-backward (`filtfilt`) zero-phase 4th-order effective response.
+    /// Forward-backward (`filtfilt`) zero-phase 4th-order response using Gustafsson (1996)
+    /// odd-symmetric reflection padding and steady-state initial filter states.
     pub fn apply_zero_phase(&self, input: &[f32]) -> Vec<f32> {
-        if input.is_empty() {
+        let n = input.len();
+        if n == 0 {
             return Vec::new();
         }
-        let mut fwd = self.apply_forward(input);
+        if n == 1 {
+            let denom = 1.0 + self.a1 + self.a2;
+            let dc_gain = if denom.abs() > 1e-12 {
+                (self.b0 + self.b1 + self.b2) / denom
+            } else {
+                0.0
+            };
+            return vec![(input[0] as f64 * dc_gain * dc_gain) as f32];
+        }
+        let pad = 12usize.min(n - 1);
+        let mut padded = Vec::with_capacity(n + 2 * pad);
+        let x_start = input[0] as f64;
+        let x_end = input[n - 1] as f64;
+        for i in (1..=pad).rev() {
+            padded.push(2.0 * x_start - (input[i] as f64));
+        }
+        for &v in input {
+            padded.push(v as f64);
+        }
+        for i in 1..=pad {
+            padded.push(2.0 * x_end - (input[n - 1 - i] as f64));
+        }
+        let mut fwd = self.apply_forward_f64_zi(&padded);
         fwd.reverse();
-        let mut bwd = self.apply_forward(&fwd);
+        let mut bwd = self.apply_forward_f64_zi(&fwd);
         bwd.reverse();
-        bwd
+        bwd[pad..pad + n].iter().map(|&v| v as f32).collect()
     }
 }
 
@@ -514,40 +579,62 @@ pub fn compute_tkeo(samples: &[f32]) -> Vec<f32> {
     out
 }
 
-/// Analytic signal envelope `|x(t) + j H{x(t)}|` via FFT-based Hilbert transform.
+/// Analytic signal envelope `|x(t) + j H{x(t)}|` via overlap-discard FFT Hilbert transform.
 pub fn hilbert_envelope(samples: &[f32]) -> Vec<f32> {
     let n = samples.len();
     if n == 0 {
         return Vec::new();
     }
-    // Process in chunks of up to 65536 samples to bound memory on multi-second 384 kHz files
-    let chunk_len = 32768usize;
-    let fft_len = 65536usize;
+    if n == 1 {
+        return vec![samples[0].abs()];
+    }
+    let fft_len = if n <= 16_384 {
+        (n * 2).next_power_of_two().clamp(64, 65_536)
+    } else {
+        65_536
+    };
+    let apron = fft_len / 4;
+    let keep = fft_len / 2;
     let mut env = Vec::with_capacity(n);
+
+    let reflect_sample = |idx: isize| -> f64 {
+        let ni = n as isize;
+        let mut p = idx;
+        if p < 0 {
+            p = -p;
+        }
+        if p >= ni {
+            let period = 2 * (ni - 1);
+            if period <= 0 {
+                return samples[0] as f64;
+            }
+            p %= period;
+            if p >= ni {
+                p = period - p;
+            }
+        }
+        samples[p as usize] as f64
+    };
 
     let mut offset = 0usize;
     while offset < n {
-        let take = (n - offset).min(chunk_len);
-        let m = if take <= 1024 {
-            take.next_power_of_two()
-        } else {
-            fft_len.min(take.next_power_of_two())
-        };
-        let mut buf = vec![Complex64::default(); m];
-        for i in 0..take {
-            buf[i] = Complex64::new(samples[offset + i] as f64, 0.0);
+        let take = (n - offset).min(keep);
+        let mut buf = vec![Complex64::default(); fft_len];
+        for (j, slot) in buf.iter_mut().enumerate() {
+            let src_idx = (offset as isize) - (apron as isize) + (j as isize);
+            *slot = Complex64::new(reflect_sample(src_idx), 0.0);
         }
         fft_radix2_in_place(&mut buf, false);
         // Analytic multiplier: 1 at DC and Nyquist, 2 on positive frequencies, 0 on negative
-        for k in 1..(m / 2) {
+        for k in 1..(fft_len / 2) {
             buf[k].re *= 2.0;
             buf[k].im *= 2.0;
         }
-        for b in buf.iter_mut().take(m).skip(m / 2 + 1) {
+        for b in buf.iter_mut().take(fft_len).skip(fft_len / 2 + 1) {
             *b = Complex64::default();
         }
         fft_radix2_in_place(&mut buf, true);
-        for b in buf.iter().take(take) {
+        for b in buf.iter().skip(apron).take(take) {
             env.push(b.norm() as f32);
         }
         offset += take;
@@ -670,4 +757,81 @@ pub fn parseval_ratio_check(signal: &[f64]) -> f64 {
     let freq_energy: f64 = buf.iter().map(|c| c.norm_sqr()).sum::<f64>() / (m as f64);
     let _ = PI; // keep math import clean
     freq_energy / time_energy
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stft_dc_and_nyquist_bins_not_inflated_by_6db() {
+        let dc = vec![0.5_f32; 2048];
+        let spec = compute_stft(
+            &dc,
+            48_000,
+            StftConfig {
+                fft_size: 512,
+                hop_size: 128,
+                window: WindowFunction::Hann,
+                subtract_median_noise_floor: false,
+                min_dbfs: -96.0,
+            },
+        );
+        let mag0 = spec.mag_grid[0];
+        let db0 = spec.db_at(0, 0);
+        assert!(
+            (mag0 - 0.5).abs() < 1e-4,
+            "Expected DC bin magnitude == 0.5, got {mag0}"
+        );
+        assert!(
+            (db0 - (-6.0206)).abs() < 0.05,
+            "Expected DC bin -6.02 ± 0.05 dBFS, got {db0}"
+        );
+    }
+
+    #[test]
+    fn hilbert_envelope_seamless_across_32768_chunk_boundary() {
+        let sr = 250_000.0_f64;
+        let n = 40_000usize;
+        let sig: Vec<f32> = (0..n)
+            .map(|i| (TAU * 10_000.0 * (i as f64) / sr).sin() as f32)
+            .collect();
+        let env = hilbert_envelope(&sig);
+        assert_eq!(env.len(), n);
+        for (i, &val) in env.iter().enumerate().take(36_000).skip(28_000) {
+            assert!(
+                (0.98..=1.02).contains(&val),
+                "Hilbert envelope at sample {i} deviated from unit amplitude: {val}"
+            );
+        }
+    }
+
+    #[test]
+    fn zero_phase_butterworth_prewarps_minus_3db_and_avoids_edge_transient() {
+        let sr = 100_000.0_f64;
+        let fc = 10_000.0_f64;
+        let n = 4096usize;
+        let tone: Vec<f32> = (0..n)
+            .map(|i| (TAU * fc * (i as f64) / sr).sin() as f32)
+            .collect();
+        let lp = BiquadCoeffs::butterworth_lowpass(fc, sr).apply_zero_phase(&tone);
+        let rms_in: f64 = (tone[1024..3072].iter().map(|&x| (x as f64).powi(2)).sum::<f64>()
+            / 2048.0)
+            .sqrt();
+        let rms_out: f64 = (lp[1024..3072].iter().map(|&x| (x as f64).powi(2)).sum::<f64>()
+            / 2048.0)
+            .sqrt();
+        let gain_db = 20.0 * (rms_out / rms_in).log10();
+        assert!(
+            (gain_db - (-3.01)).abs() < 0.20,
+            "Expected zero-phase LP -3.01 dB at fc={fc}, got {gain_db:.3} dB"
+        );
+
+        let dc_sig = vec![1.0_f32; 256];
+        let dc_out = BiquadCoeffs::butterworth_lowpass(fc, sr).apply_zero_phase(&dc_sig);
+        assert!(
+            dc_out.iter().all(|&v| (v - 1.0).abs() < 1e-4),
+            "Gustafsson steady-state padding should keep constant signal flat"
+        );
+    }
 }

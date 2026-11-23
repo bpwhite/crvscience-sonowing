@@ -85,7 +85,7 @@ pub fn compute_soundscape_indices(samples: &[f32], spec: &Spectrogram) -> Sounds
         }
     }
 
-    // 2. NDSI (Kasten et al. 2012): Biophony (2-11 kHz, or 16-90 kHz if pure ultrasonic) vs Anthrophony (0.5-2 kHz)
+    // 2. NDSI (Kasten et al. 2012): Biophony (2-11 kHz, or 16-90 kHz if pure ultrasonic) vs Anthrophony (1-2 kHz)
     let mut anthro_psd = 0.0_f64;
     let mut biophony_psd = 0.0_f64;
     let mut ultra_psd = 0.0_f64;
@@ -109,7 +109,7 @@ pub fn compute_soundscape_indices(samples: &[f32], spec: &Spectrogram) -> Sounds
         };
         total_psd += p_mean;
 
-        if (500.0..2_000.0).contains(&freq) {
+        if (1_000.0..2_000.0).contains(&freq) {
             anthro_psd += p_mean;
         } else if (2_000.0..=11_000.0).contains(&freq) {
             biophony_psd += p_mean;
@@ -165,7 +165,8 @@ pub fn compute_soundscape_indices(samples: &[f32], spec: &Spectrogram) -> Sounds
         nyquist_hz.min(12_000.0)
     };
     let step_hz = max_band_hz / num_bands as f64;
-    let thresh_dbfs = -52.0_f32;
+    let thresh_dbfs = -50.0_f32;
+    let b_end_excl = (spec.freq_to_bin(max_band_hz) + 1).min(spec.num_bins);
     let mut props = Vec::with_capacity(num_bands);
     let mut band_occupancy = Vec::with_capacity(num_bands);
 
@@ -173,17 +174,26 @@ pub fn compute_soundscape_indices(samples: &[f32], spec: &Spectrogram) -> Sounds
         let f0 = k as f64 * step_hz;
         let f1 = (k + 1) as f64 * step_hz;
         let kb0 = spec.freq_to_bin(f0).max(1);
-        let kb1 = spec.freq_to_bin(f1).min(spec.num_bins - 1).max(kb0);
-        let total_cells = ((kb1 - kb0 + 1) * spec.num_frames).max(1);
-        let mut active_cells = 0usize;
-        for fr in 0..spec.num_frames {
-            for b in kb0..=kb1 {
-                if spec.db_at(fr, b) >= thresh_dbfs {
-                    active_cells += 1;
+        let kb1_excl = if k + 1 == num_bands {
+            b_end_excl.max(kb0)
+        } else {
+            spec.freq_to_bin(f1).clamp(kb0, b_end_excl)
+        };
+        let bin_count = kb1_excl.saturating_sub(kb0);
+        let occ = if bin_count == 0 {
+            0.0
+        } else {
+            let total_cells = bin_count * spec.num_frames;
+            let mut active_cells = 0usize;
+            for fr in 0..spec.num_frames {
+                for b in kb0..kb1_excl {
+                    if spec.db_at(fr, b) >= thresh_dbfs {
+                        active_cells += 1;
+                    }
                 }
             }
-        }
-        let occ = active_cells as f64 / total_cells as f64;
+            active_cells as f64 / total_cells as f64
+        };
         props.push(occ);
         band_occupancy.push((format!("{:.1}-{:.1} kHz", f0 * 0.001, f1 * 0.001), occ));
     }
@@ -267,4 +277,65 @@ fn gini_coefficient(values: &[f64]) -> f64 {
     }
     let n_f = n as f64;
     ((2.0 * weighted) / (n_f * sum) - (n_f + 1.0) / n_f).clamp(0.0, 1.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn adi_aei_half_open_bins_do_not_double_count_shared_boundary_bins() {
+        // 24 kHz sample rate (12 kHz Nyquist) with fft_size = 240 -> 100 Hz/bin, 10 bands of 1.2 kHz
+        // Boundary between band 0 (0-1.2 kHz) and band 1 (1.2-2.4 kHz) is exact bin 12 (1200 Hz).
+        let fft_size = 240usize;
+        let num_bins = fft_size / 2 + 1;
+        let num_frames = 4usize;
+        let mut db_grid = vec![-96.0_f32; num_frames * num_bins];
+        let mut mag_grid = vec![0.0_f32; num_frames * num_bins];
+        let boundary_bin = 12usize; // 1200 Hz
+        for fr in 0..num_frames {
+            db_grid[fr * num_bins + boundary_bin] = -20.0;
+            mag_grid[fr * num_bins + boundary_bin] = 0.1;
+        }
+        let spec = Spectrogram {
+            sample_rate_hz: 24_000,
+            fft_size,
+            hop_size: 120,
+            num_frames,
+            num_bins,
+            db_grid,
+            mag_grid,
+            frame_peak_freq_hz: vec![1200.0; num_frames],
+            frame_peak_dbfs: vec![-20.0; num_frames],
+            frame_centroid_hz: vec![1200.0; num_frames],
+            frame_wiener_entropy: vec![0.0; num_frames],
+            bin_noise_floor_dbfs: vec![-96.0; num_bins],
+        };
+        let samples = vec![0.01_f32; 600];
+        let idx = compute_soundscape_indices(&samples, &spec);
+
+        let nonzero_bands: Vec<usize> = idx
+            .band_occupancy
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, occ))| *occ > 0.0)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            nonzero_bands,
+            vec![1],
+            "Boundary bin 12 (1.2 kHz) must belong strictly to band 1 (1.2-2.4 kHz), got {:?}",
+            idx.band_occupancy
+        );
+        assert!(
+            idx.adi.abs() < 1e-12,
+            "Single occupied band must yield ADI == 0.0, got {}",
+            idx.adi
+        );
+        assert!(
+            (idx.aei - 0.9).abs() < 1e-12,
+            "Single occupied band out of 10 must yield Gini AEI == 0.9, got {}",
+            idx.aei
+        );
+    }
 }
