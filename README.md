@@ -37,6 +37,7 @@ All single-key shortcuts ignore input while typing in text fields (`!ctx.wants_k
 | `Scroll Wheel` | Cursor-anchored zoom (Shift: frequency only, Ctrl: time only) |
 | `Double-Click` | Reset full time & frequency zoom |
 | `F1` | Toggle 20-species acoustic reference key & shortcut modal |
+| `Ctrl+K` | Open fuzzy command palette (`Up`/`Down`/`Enter`/`Esc`) for species presets, STFT/FFT modes, filters & exports |
 | `F5` / `F9` | Quick save / open saved SQLite WAL sessions |
 | `Esc` | Close active modal -> Clear spectrogram caliper |
 | `Drag & Drop` | Drop `.wav`, `.zc`, `.zcf`, or `.sonoworkset.json` onto window |
@@ -67,6 +68,9 @@ cargo run --release -- transcode samples/MYLU_Willamette_Demo_250kHz.wav \
 
 # Generate synthetic calibrated preset WAV (B1..B4, A1..A4, M1)
 cargo run --release -- synth-demo --preset B1 --output demo_b1.wav
+
+# Export batch call-classifier SNR sweep & confusion-matrix diagnostic (JSON + CSV)
+cargo run --release -- classifier-diag --snr-list 8.0,12.0,16.0,20.0 --out-dir exports
 ```
 
 | CLI Flag / Subcommand | Default | Purpose |
@@ -80,10 +84,11 @@ cargo run --release -- synth-demo --preset B1 --output demo_b1.wav
 | `record-mic` | `--seconds 3.0 --ultrasonic` | Capture live hardware UAC2 or `--simulated` audio to GUANO WAV |
 | `transcode <FILE>` | `--mode te10` | Export audible `48 kHz` WAV (`te10`, `te20`, `heterodyne`, `fdiv`) |
 | `synth-demo` | `--preset B1` | Synthesize calibrated bat/bird GUANO WAV (`B1–B4`, `A1–A4`, `M1`) |
+| `classifier-diag` | `--snr-list 8.0,12.0,16.0,20.0` | Export 9-preset SNR & confusion-matrix diagnostic summary (`JSON` + `CSV`) |
 
 ## Validation Suite & Empirical Metrics
 
-Run `$env:CARGO_BUILD_JOBS='4'; cargo test --all-targets` (`26` unit tests in `src/lib.rs`, `1` in `src/main.rs`, `10` integration tests in `tests/bioacoustic_suite.rs`):
+Run `$env:CARGO_BUILD_JOBS='4'; cargo test --all-targets` (`33` unit tests in `src/lib.rs`, `2` in `src/main.rs`, `10` integration tests in `tests/bioacoustic_suite.rs`):
 
 | Test | Verified Metric / Outcome |
 |---|---|

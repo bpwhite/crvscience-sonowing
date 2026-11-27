@@ -34,3 +34,9 @@ pub mod synth_presets;
 pub mod taxa_library;
 pub mod ultrasonic_audio;
 pub mod wav_guano;
+
+pub use exporters::{
+    evaluate_batch_classifier_diagnostic, export_classifier_diagnostic_files,
+    format_classifier_diagnostic_csv, BatchClassifierDiagnosticReport, ConfusionMatrixCell,
+    PresetSnrDiagnosticRow,
+};

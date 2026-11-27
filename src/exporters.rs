@@ -20,10 +20,14 @@
 //! 2. **NABat / SonoBat & Avian Pass/Pulse Summary RFC 4180 CSV** with call, harmonic, cluster, and soundscape summary rows.
 //! 3. **SHA-256 Verified `.sonoworkset.json` Portable Session Envelope (`v1.1.0`, backward-compatible with `v1.0.0`)**.
 
-use crate::call_extractor::{BehavioralPhase, DetectedCallEvent, TaxonDomain};
+use crate::call_extractor::{
+    extract_calls, BehavioralPhase, DetectedCallEvent, DetectionMode, DetectorConfig, TaxonDomain,
+};
+use crate::dsp::{compute_stft, StftConfig};
 use crate::harmonic_tracker::HarmonicStackProfile;
 use crate::mfcc_cluster::RepertoireClusterReport;
 use crate::soundscape_indices::SoundscapeIndices;
+use crate::synth_presets::{synthesize_preset, BuiltinPreset};
 use crate::wav_guano::GuanoMetadata;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -430,6 +434,239 @@ pub fn csv_escape(field: &str) -> String {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PresetSnrDiagnosticRow {
+    pub preset_code: String,
+    pub expected_species_codes: Vec<String>,
+    pub snr_threshold_db: f32,
+    pub sample_rate_hz: u32,
+    pub detected_calls: usize,
+    pub expected_hits: usize,
+    pub misclassified_calls: usize,
+    pub precision: f64,
+    pub mean_call_snr_db: f64,
+    pub mean_confidence: f64,
+    pub top_predicted_code: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfusionMatrixCell {
+    pub snr_threshold_db: f32,
+    pub expected_group: String,
+    pub predicted_code: String,
+    pub count: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BatchClassifierDiagnosticReport {
+    pub schema_version: String,
+    pub preset_count: usize,
+    pub snr_thresholds_db: Vec<f32>,
+    pub total_calls_evaluated: usize,
+    pub overall_expected_hits: usize,
+    pub overall_precision: f64,
+    pub rows: Vec<PresetSnrDiagnosticRow>,
+    pub confusion_matrix: Vec<ConfusionMatrixCell>,
+}
+
+/// Evaluates all 9 built-in calibrated acoustic presets (`B1..B4`, `A1..A4`, `M1`) across one or
+/// more SNR trigger thresholds, building per-preset precision/SNR diagnostics and a confusion matrix.
+pub fn evaluate_batch_classifier_diagnostic(
+    snr_thresholds_db: &[f32],
+) -> BatchClassifierDiagnosticReport {
+    let thresholds: Vec<f32> = if snr_thresholds_db.is_empty() {
+        vec![8.0, 12.0, 16.0, 20.0]
+    } else {
+        snr_thresholds_db
+            .iter()
+            .copied()
+            .map(|v| v.clamp(4.0, 32.0))
+            .collect()
+    };
+
+    let mut rows = Vec::new();
+    let mut confusion_counts: BTreeMap<(String, String, String), (f32, usize)> = BTreeMap::new();
+    let mut total_calls = 0usize;
+    let mut total_hits = 0usize;
+
+    for &snr_db in &thresholds {
+        let snr_key = format!("{snr_db:.2}");
+        for preset in BuiltinPreset::ALL {
+            let rec = synthesize_preset(preset);
+            let expected_codes: Vec<String> = rec
+                .guano
+                .as_ref()
+                .map(|g| g.species_auto_id.clone())
+                .unwrap_or_default();
+            let expected_group = if expected_codes.is_empty() {
+                preset.code().to_string()
+            } else {
+                expected_codes.join("+")
+            };
+
+            let stft_cfg = StftConfig {
+                fft_size: if rec.sample_rate_hz >= 160_000 { 512 } else { 1024 },
+                hop_size: if rec.sample_rate_hz >= 160_000 { 64 } else { 256 },
+                ..Default::default()
+            };
+            let det_cfg = DetectorConfig {
+                mode: DetectionMode::AutoWideband,
+                snr_threshold_db: snr_db,
+                ..Default::default()
+            };
+            let spec = compute_stft(&rec.samples, rec.sample_rate_hz, stft_cfg);
+            let calls = extract_calls(&rec.samples, &spec, det_cfg);
+
+            let mut expected_hits = 0usize;
+            let mut snr_sum = 0.0_f64;
+            let mut conf_sum = 0.0_f64;
+            let mut pred_hist: BTreeMap<String, usize> = BTreeMap::new();
+
+            for ev in &calls {
+                let pred = ev.primary_code().to_string();
+                let is_hit = expected_codes.iter().any(|c| c.eq_ignore_ascii_case(&pred));
+                if is_hit {
+                    expected_hits += 1;
+                }
+                snr_sum += sanitize_finite(ev.snr_db as f64);
+                conf_sum += sanitize_finite(ev.primary_confidence());
+                *pred_hist.entry(pred.clone()).or_insert(0) += 1;
+
+                let cell = confusion_counts
+                    .entry((snr_key.clone(), expected_group.clone(), pred))
+                    .or_insert((snr_db, 0));
+                cell.1 += 1;
+            }
+
+            let detected = calls.len();
+            let misclassified = detected.saturating_sub(expected_hits);
+            let precision = if detected > 0 {
+                expected_hits as f64 / detected as f64
+            } else {
+                0.0
+            };
+            let mean_call_snr_db = if detected > 0 {
+                snr_sum / detected as f64
+            } else {
+                0.0
+            };
+            let mean_confidence = if detected > 0 {
+                conf_sum / detected as f64
+            } else {
+                0.0
+            };
+            let top_predicted_code = pred_hist
+                .into_iter()
+                .max_by_key(|(_, cnt)| *cnt)
+                .map(|(code, _)| code)
+                .unwrap_or_else(|| "NONE".to_string());
+
+            total_calls += detected;
+            total_hits += expected_hits;
+
+            rows.push(PresetSnrDiagnosticRow {
+                preset_code: preset.code().to_string(),
+                expected_species_codes: expected_codes,
+                snr_threshold_db: snr_db,
+                sample_rate_hz: rec.sample_rate_hz,
+                detected_calls: detected,
+                expected_hits,
+                misclassified_calls: misclassified,
+                precision,
+                mean_call_snr_db,
+                mean_confidence,
+                top_predicted_code,
+            });
+        }
+    }
+
+    let confusion_matrix = confusion_counts
+        .into_iter()
+        .map(|((_, expected_group, predicted_code), (snr_threshold_db, count))| {
+            ConfusionMatrixCell {
+                snr_threshold_db,
+                expected_group,
+                predicted_code,
+                count,
+            }
+        })
+        .collect();
+
+    let overall_precision = if total_calls > 0 {
+        total_hits as f64 / total_calls as f64
+    } else {
+        0.0
+    };
+
+    BatchClassifierDiagnosticReport {
+        schema_version: "sonowing_classifier_diagnostic_v1".to_string(),
+        preset_count: BuiltinPreset::ALL.len(),
+        snr_thresholds_db: thresholds,
+        total_calls_evaluated: total_calls,
+        overall_expected_hits: total_hits,
+        overall_precision,
+        rows,
+        confusion_matrix,
+    }
+}
+
+/// Formats a [`BatchClassifierDiagnosticReport`] as an RFC 4180 CSV table (preset SNR rows + confusion-matrix rows).
+pub fn format_classifier_diagnostic_csv(report: &BatchClassifierDiagnosticReport) -> String {
+    let mut out = String::from(
+        "record_type,snr_threshold_db,preset_or_expected,expected_species,predicted_code,sample_rate_hz,detected_or_count,expected_hits,misclassified_calls,precision,mean_call_snr_db,mean_confidence\r\n",
+    );
+    for r in &report.rows {
+        let exp = r.expected_species_codes.join("+");
+        out.push_str(&format!(
+            "PRESET_SNR,{:.2},{},{},{},{},{},{},{},{:.4},{:.2},{:.4}\r\n",
+            r.snr_threshold_db,
+            csv_escape(&r.preset_code),
+            csv_escape(&exp),
+            csv_escape(&r.top_predicted_code),
+            r.sample_rate_hz,
+            r.detected_calls,
+            r.expected_hits,
+            r.misclassified_calls,
+            r.precision,
+            r.mean_call_snr_db,
+            r.mean_confidence,
+        ));
+    }
+    for c in &report.confusion_matrix {
+        out.push_str(&format!(
+            "CONFUSION_CELL,{:.2},{},{},{},0,{},0,0,0.0000,0.00,0.0000\r\n",
+            c.snr_threshold_db,
+            csv_escape(&c.expected_group),
+            csv_escape(&c.expected_group),
+            csv_escape(&c.predicted_code),
+            c.count,
+        ));
+    }
+    out
+}
+
+/// Evaluates and writes `sonowing_classifier_diagnostic.json` and `.csv` into `out_dir`.
+pub fn export_classifier_diagnostic_files(
+    out_dir: &Path,
+    snr_thresholds_db: &[f32],
+) -> Result<(std::path::PathBuf, std::path::PathBuf, BatchClassifierDiagnosticReport), String> {
+    fs::create_dir_all(out_dir)
+        .map_err(|e| format!("Failed creating diagnostic export dir: {e}"))?;
+    let report = evaluate_batch_classifier_diagnostic(snr_thresholds_db);
+    let json_path = out_dir.join("sonowing_classifier_diagnostic.json");
+    let csv_path = out_dir.join("sonowing_classifier_diagnostic.csv");
+
+    let json_txt = serde_json::to_string_pretty(&report)
+        .map_err(|e| format!("Diagnostic JSON serialize error: {e}"))?;
+    fs::write(&json_path, json_txt)
+        .map_err(|e| format!("Write diagnostic JSON failed: {e}"))?;
+    let csv_txt = format_classifier_diagnostic_csv(&report);
+    fs::write(&csv_path, csv_txt)
+        .map_err(|e| format!("Write diagnostic CSV failed: {e}"))?;
+
+    Ok((json_path, csv_path, report))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,5 +725,56 @@ mod tests {
         assert_eq!(csv_escape("site_A, plot_2.wav"), "\"site_A, plot_2.wav\"");
         assert_eq!(csv_escape("call_\"buzz\".wav"), "\"call_\"\"buzz\"\".wav\"");
         assert_eq!(csv_escape("line1\nline2"), "\"line1\nline2\"");
+    }
+
+    #[test]
+    fn batch_classifier_diagnostic_evaluates_all_nine_presets_across_snr_thresholds() {
+        let rep = evaluate_batch_classifier_diagnostic(&[10.0, 14.0]);
+        assert_eq!(rep.schema_version, "sonowing_classifier_diagnostic_v1");
+        assert_eq!(rep.preset_count, 9);
+        assert_eq!(rep.snr_thresholds_db, vec![10.0, 14.0]);
+        assert_eq!(rep.rows.len(), 18);
+        assert!(rep.total_calls_evaluated > 0);
+        assert!(rep.overall_precision > 0.5 && rep.overall_precision <= 1.0);
+        assert!(!rep.confusion_matrix.is_empty());
+    }
+
+    #[test]
+    fn batch_classifier_diagnostic_json_and_csv_export_roundtrip_are_valid() {
+        let out_dir = std::env::temp_dir().join(format!(
+            "sonowing_diag_export_test_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&out_dir);
+        let (jp, cp, rep) = export_classifier_diagnostic_files(&out_dir, &[12.0])
+            .expect("classifier diagnostic export succeeds");
+        assert!(jp.exists());
+        assert!(cp.exists());
+
+        let parsed: BatchClassifierDiagnosticReport =
+            serde_json::from_str(&std::fs::read_to_string(&jp).expect("read diag json"))
+                .expect("parse diag json");
+        assert_eq!(parsed.rows.len(), rep.rows.len());
+
+        let csv_txt = std::fs::read_to_string(&cp).expect("read diag csv");
+        let lines: Vec<&str> = csv_txt.lines().collect();
+        assert!(lines.len() >= 11, "header + 9 preset rows + confusion cells");
+        assert!(lines[0].starts_with("record_type,snr_threshold_db,preset_or_expected"));
+        assert!(lines.iter().any(|l| l.starts_with("PRESET_SNR,")));
+        assert!(lines.iter().any(|l| l.starts_with("CONFUSION_CELL,")));
+
+        let _ = std::fs::remove_dir_all(&out_dir);
+    }
+
+    #[test]
+    fn batch_classifier_higher_snr_threshold_never_increases_detected_calls() {
+        let low_snr = evaluate_batch_classifier_diagnostic(&[8.0]);
+        let high_snr = evaluate_batch_classifier_diagnostic(&[22.0]);
+        assert!(
+            high_snr.total_calls_evaluated <= low_snr.total_calls_evaluated,
+            "22 dB calls ({}) should be <= 8 dB calls ({})",
+            high_snr.total_calls_evaluated,
+            low_snr.total_calls_evaluated
+        );
     }
 }

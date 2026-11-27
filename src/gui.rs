@@ -27,7 +27,8 @@ use crate::dsp::{
     extract_zero_crossing_dots, Spectrogram, StftConfig, WindowFunction,
 };
 use crate::exporters::{
-    write_calls_csv, write_raven_selection_table, SignedWorksetEnvelope, WorksetPayload,
+    export_classifier_diagnostic_files, write_calls_csv, write_raven_selection_table,
+    BatchClassifierDiagnosticReport, SignedWorksetEnvelope, WorksetPayload,
 };
 use crate::harmonic_tracker::{analyze_harmonic_stacks, HarmonicStackProfile};
 use crate::live_mic::LiveMicEngine;
@@ -52,6 +53,53 @@ use eframe::egui::{
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SonoPaletteAction {
+    LoadPreset(BuiltinPreset),
+    StftBatFm,
+    StftBatCf,
+    StftAvianNfc,
+    SetPalette(ColormapPalette),
+    ToggleLogFreqAxis,
+    ResetZoom,
+    ToggleBandpass,
+    ToggleMedianDenoise,
+    SetDetectionMode(DetectionMode),
+    ExportClassifierDiagnostic,
+    ExportRavenTable,
+    ExportCallsCsv,
+    ExportWorkset,
+    QuickSaveSqlite,
+}
+
+fn fuzzy_sonowing_score(query: &str, candidate: &str) -> Option<i32> {
+    let q: Vec<char> = query.trim().to_ascii_lowercase().chars().collect();
+    if q.is_empty() {
+        return Some(0);
+    }
+    let cand_lower = candidate.to_ascii_lowercase();
+    if let Some(pos) = cand_lower.find(&q.iter().collect::<String>()) {
+        return Some(200 - pos as i32);
+    }
+    let mut qi = 0usize;
+    let mut score = 0i32;
+    let mut prev_match = false;
+    for ch in cand_lower.chars() {
+        if qi < q.len() && ch == q[qi] {
+            score += if prev_match { 12 } else { 5 };
+            prev_match = true;
+            qi += 1;
+        } else {
+            prev_match = false;
+        }
+    }
+    if qi == q.len() {
+        Some(score)
+    } else {
+        None
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AppStage {
@@ -400,6 +448,11 @@ pub struct SonoWingApp {
     pub show_reference_modal: bool,
     pub show_sessions_modal: bool,
     pub show_about_modal: bool,
+    pub show_command_palette: bool,
+    pub command_palette_query: String,
+    pub command_palette_selected: usize,
+    pub palette_focus_pending: bool,
+    pub last_classifier_diag: Option<BatchClassifierDiagnosticReport>,
     pub recent_sessions: Vec<SavedSessionSummary>,
     db_path: PathBuf,
     spec_texture: Option<TextureHandle>,
@@ -548,6 +601,11 @@ impl SonoWingApp {
             show_reference_modal: false,
             show_sessions_modal: false,
             show_about_modal: false,
+            show_command_palette: false,
+            command_palette_query: String::new(),
+            command_palette_selected: 0,
+            palette_focus_pending: false,
+            last_classifier_diag: None,
             recent_sessions: Vec::new(),
             db_path,
             spec_texture: None,
@@ -1238,6 +1296,7 @@ impl SonoWingApp {
         let wants_kb = ctx.wants_keyboard_input();
         let (
             esc_pressed,
+            ctrl_k_pressed,
             space_pressed,
             f1_pressed,
             f5_pressed,
@@ -1250,8 +1309,10 @@ impl SonoWingApp {
             num2_pressed,
             num3_pressed,
         ) = ctx.input(|i| {
+            let cmd = i.modifiers.ctrl || i.modifiers.command;
             (
                 i.key_pressed(egui::Key::Escape),
+                cmd && i.key_pressed(egui::Key::K),
                 i.key_pressed(egui::Key::Space),
                 i.key_pressed(egui::Key::F1),
                 i.key_pressed(egui::Key::F5),
@@ -1266,8 +1327,20 @@ impl SonoWingApp {
             )
         });
 
+        if ctrl_k_pressed {
+            if self.show_command_palette {
+                self.show_command_palette = false;
+            } else if !wants_kb {
+                self.show_command_palette = true;
+                self.command_palette_query.clear();
+                self.command_palette_selected = 0;
+                self.palette_focus_pending = true;
+            }
+        }
         if esc_pressed {
-            if self.show_about_modal {
+            if self.show_command_palette {
+                self.show_command_palette = false;
+            } else if self.show_about_modal {
                 self.show_about_modal = false;
             } else if self.show_reference_modal {
                 self.show_reference_modal = false;
@@ -1279,18 +1352,20 @@ impl SonoWingApp {
                 self.caliper_dragging = false;
             }
         }
-        if f1_pressed {
+        if f1_pressed && !self.show_command_palette {
             self.show_reference_modal = !self.show_reference_modal;
         }
-        if f5_pressed {
+        if f5_pressed && !self.show_command_palette {
             self.quick_save_sqlite();
         }
-        if f9_pressed {
+        if f9_pressed && !self.show_command_palette {
             self.refresh_sessions_list();
             self.show_sessions_modal = true;
         }
-        let any_modal_open =
-            self.show_about_modal || self.show_reference_modal || self.show_sessions_modal;
+        let any_modal_open = self.show_command_palette
+            || self.show_about_modal
+            || self.show_reference_modal
+            || self.show_sessions_modal;
         if self.stage == AppStage::Workstation && !any_modal_open && !wants_kb {
             if space_pressed {
                 if self.audio_player.is_playing() {
@@ -1362,6 +1437,226 @@ impl SonoWingApp {
         }
         if self.show_about_modal {
             self.render_about_modal(ctx);
+        }
+        if self.show_command_palette {
+            self.render_command_palette_modal(ctx);
+        }
+    }
+
+    pub fn palette_commands() -> Vec<(&'static str, &'static str, SonoPaletteAction)> {
+        let mut cmds = Vec::new();
+        for p in BuiltinPreset::ALL {
+            cmds.push((p.title(), "Species Presets", SonoPaletteAction::LoadPreset(p)));
+        }
+        cmds.push(("STFT: Bat FM Preset (512 pts / 64 hop / Blackman-Harris)", "Spectrogram & FFT", SonoPaletteAction::StftBatFm));
+        cmds.push(("STFT: Bat CF Preset (2048 pts / 128 hop / Blackman-Harris)", "Spectrogram & FFT", SonoPaletteAction::StftBatCf));
+        cmds.push(("STFT: Avian NFC Preset (1024 pts / 256 hop / Hann)", "Spectrogram & FFT", SonoPaletteAction::StftAvianNfc));
+        for pal in ColormapPalette::ALL {
+            cmds.push((pal.label(), "Spectrogram & FFT", SonoPaletteAction::SetPalette(pal)));
+        }
+        cmds.push(("Spectrogram: Toggle Logarithmic Frequency Axis (Log-kHz)", "Spectrogram & FFT", SonoPaletteAction::ToggleLogFreqAxis));
+        cmds.push(("Spectrogram: Reset Full Time & Nyquist Zoom (0 / Z)", "Spectrogram & FFT", SonoPaletteAction::ResetZoom));
+        cmds.push(("Filter: Toggle 4th-Order Zero-Phase Butterworth Bandpass", "Acoustic Filters", SonoPaletteAction::ToggleBandpass));
+        cmds.push(("Filter: Toggle Median Per-Bin Spectral Denoising", "Acoustic Filters", SonoPaletteAction::ToggleMedianDenoise));
+        for m in DetectionMode::ALL {
+            cmds.push((m.label(), "Acoustic Filters", SonoPaletteAction::SetDetectionMode(m)));
+        }
+        cmds.push(("Export: Batch Classifier SNR & Confusion Matrix (JSON + CSV)", "Exports", SonoPaletteAction::ExportClassifierDiagnostic));
+        cmds.push(("Export: Raven Pro 1.6 Selection Table (.selections.txt)", "Exports", SonoPaletteAction::ExportRavenTable));
+        cmds.push(("Export: NABat / Avian Summary CSV", "Exports", SonoPaletteAction::ExportCallsCsv));
+        cmds.push(("Export: SHA-256 Verified .sonoworkset.json", "Exports", SonoPaletteAction::ExportWorkset));
+        cmds.push(("Session: Quick Save to SQLite WAL (F5)", "Session", SonoPaletteAction::QuickSaveSqlite));
+        cmds
+    }
+
+    pub fn filtered_palette_commands(&self) -> Vec<(&'static str, &'static str, SonoPaletteAction)> {
+        let q = self.command_palette_query.trim();
+        let all = Self::palette_commands();
+        if q.is_empty() {
+            return all;
+        }
+        let mut scored: Vec<(i32, (&'static str, &'static str, SonoPaletteAction))> = all
+            .into_iter()
+            .filter_map(|item| {
+                let hay = format!("{} {}", item.1, item.0);
+                fuzzy_sonowing_score(q, &hay).map(|s| (s, item))
+            })
+            .collect();
+        scored.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1 .0.cmp(b.1 .0)));
+        scored.into_iter().map(|(_, item)| item).collect()
+    }
+
+    pub fn execute_palette_action(&mut self, action: SonoPaletteAction) {
+        match action {
+            SonoPaletteAction::LoadPreset(p) => {
+                self.load_preset(p);
+                self.stage = AppStage::Workstation;
+            }
+            SonoPaletteAction::StftBatFm => {
+                self.stft_cfg.fft_size = 512;
+                self.stft_cfg.hop_size = 64;
+                self.stft_cfg.window = WindowFunction::BlackmanHarris4;
+                self.detector_cfg.mode = DetectionMode::BatUltrasonicOnly;
+                self.recompute_full_pipeline(false);
+                self.status_banner = "Applied STFT Bat FM preset (512/64)".to_string();
+            }
+            SonoPaletteAction::StftBatCf => {
+                self.stft_cfg.fft_size = 2048;
+                self.stft_cfg.hop_size = 128;
+                self.stft_cfg.window = WindowFunction::BlackmanHarris4;
+                self.detector_cfg.mode = DetectionMode::BatUltrasonicOnly;
+                self.recompute_full_pipeline(false);
+                self.status_banner = "Applied STFT Bat CF preset (2048/128)".to_string();
+            }
+            SonoPaletteAction::StftAvianNfc => {
+                self.stft_cfg.fft_size = 1024;
+                self.stft_cfg.hop_size = 256;
+                self.stft_cfg.window = WindowFunction::Hann;
+                self.detector_cfg.mode = DetectionMode::BirdAudibleOnly;
+                self.recompute_full_pipeline(false);
+                self.status_banner = "Applied STFT Avian NFC preset (1024/256)".to_string();
+            }
+            SonoPaletteAction::SetPalette(pal) => {
+                self.palette = pal;
+                self.spec_dirty = true;
+                self.status_banner = format!("Switched colormap -> {}", pal.label());
+            }
+            SonoPaletteAction::ToggleLogFreqAxis => {
+                self.log_freq_axis = !self.log_freq_axis;
+                self.spec_dirty = true;
+            }
+            SonoPaletteAction::ResetZoom => {
+                self.view_start_s = 0.0;
+                self.view_end_s = self.raw_recording.duration_s().max(0.05);
+                self.freq_min_khz = 0.0;
+                self.freq_max_khz = (self.raw_recording.nyquist_hz() * 0.001).max(1.0);
+                self.spec_dirty = true;
+            }
+            SonoPaletteAction::ToggleBandpass => {
+                self.apply_bandpass = !self.apply_bandpass;
+                self.recompute_full_pipeline(false);
+                self.status_banner = if self.apply_bandpass {
+                    format!(
+                        "Enabled 4th-order zero-phase bandpass ({:.1}-{:.1} kHz)",
+                        self.bandpass_low_khz, self.bandpass_high_khz
+                    )
+                } else {
+                    "Disabled zero-phase bandpass filter".to_string()
+                };
+            }
+            SonoPaletteAction::ToggleMedianDenoise => {
+                self.stft_cfg.subtract_median_noise_floor = !self.stft_cfg.subtract_median_noise_floor;
+                self.recompute_full_pipeline(false);
+            }
+            SonoPaletteAction::SetDetectionMode(mode) => {
+                self.detector_cfg.mode = mode;
+                self.recompute_full_pipeline(false);
+                self.status_banner = format!("Detector band -> {}", mode.label());
+            }
+            SonoPaletteAction::ExportClassifierDiagnostic => {
+                self.export_classifier_diagnostic();
+            }
+            SonoPaletteAction::ExportRavenTable => self.export_raven_and_csv(true, false),
+            SonoPaletteAction::ExportCallsCsv => self.export_raven_and_csv(false, true),
+            SonoPaletteAction::ExportWorkset => self.export_workset_envelope(),
+            SonoPaletteAction::QuickSaveSqlite => self.quick_save_sqlite(),
+        }
+    }
+
+    pub fn export_classifier_diagnostic(&mut self) {
+        let dir = self.resolved_export_dir();
+        match export_classifier_diagnostic_files(&dir, &[8.0, 12.0, 16.0, 20.0]) {
+            Ok((jp, cp, rep)) => {
+                self.status_banner = format!(
+                    "Exported classifier SNR/confusion diagnostic ({} calls, {:.1}% precision) -> {} & {}",
+                    rep.total_calls_evaluated,
+                    rep.overall_precision * 100.0,
+                    jp.display(),
+                    cp.display()
+                );
+                self.last_classifier_diag = Some(rep);
+            }
+            Err(e) => {
+                self.status_banner = format!("Classifier diagnostic export error: {e}");
+            }
+        }
+    }
+
+    fn render_command_palette_modal(&mut self, ctx: &egui::Context) {
+        let filtered = self.filtered_palette_commands();
+        if !filtered.is_empty() {
+            self.command_palette_selected = self.command_palette_selected.min(filtered.len() - 1);
+        } else {
+            self.command_palette_selected = 0;
+        }
+        let (up_pressed, down_pressed, enter_pressed) = ctx.input(|i| {
+            (
+                i.key_pressed(egui::Key::ArrowUp),
+                i.key_pressed(egui::Key::ArrowDown),
+                i.key_pressed(egui::Key::Enter),
+            )
+        });
+        if up_pressed && !filtered.is_empty() {
+            self.command_palette_selected = if self.command_palette_selected == 0 {
+                filtered.len() - 1
+            } else {
+                self.command_palette_selected - 1
+            };
+        }
+        if down_pressed && !filtered.is_empty() {
+            self.command_palette_selected = (self.command_palette_selected + 1) % filtered.len();
+        }
+        let mut exec_act: Option<SonoPaletteAction> = if enter_pressed {
+            filtered.get(self.command_palette_selected).map(|(_, _, a)| *a)
+        } else {
+            None
+        };
+        let mut open = self.show_command_palette;
+        egui::Window::new("Command Palette (Ctrl+K)")
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_TOP, Vec2::new(0.0, 56.0))
+            .default_width(560.0)
+            .show(ctx, |ui| {
+                let edit = ui.add(
+                    egui::TextEdit::singleline(&mut self.command_palette_query)
+                        .id(egui::Id::new("sonowing_cmd_palette_input"))
+                        .desired_width(f32::INFINITY)
+                        .hint_text("Filter bat/bird presets, STFT/FFT modes, filters, or exports..."),
+                );
+                if self.palette_focus_pending {
+                    edit.request_focus();
+                    self.palette_focus_pending = false;
+                }
+                if edit.changed() {
+                    self.command_palette_selected = 0;
+                }
+                ui.add_space(4.0);
+                egui::ScrollArea::vertical().max_height(280.0).show(ui, |ui| {
+                    if filtered.is_empty() {
+                        ui.small("No matching commands.");
+                    } else {
+                        for (idx, (label, group, act)) in filtered.iter().enumerate() {
+                            let selected = idx == self.command_palette_selected;
+                            if ui
+                                .selectable_label(selected, format!("[{group}] {label}"))
+                                .clicked()
+                            {
+                                exec_act = Some(*act);
+                            }
+                        }
+                    }
+                });
+                ui.separator();
+                ui.small("Up/Down: Navigate  |  Enter: Execute  |  Esc: Close");
+            });
+        if !open {
+            self.show_command_palette = false;
+        }
+        if let Some(act) = exec_act {
+            self.show_command_palette = false;
+            self.execute_palette_action(act);
         }
     }
 }
@@ -3651,6 +3946,13 @@ impl SonoWingApp {
                 if ui.button("Export SHA-256 Workset").clicked() {
                     self.export_workset_envelope();
                 }
+                if ui
+                    .button("Classifier SNR / Confusion (JSON+CSV)")
+                    .on_hover_text("Evaluate all 9 species presets across SNR thresholds and export confusion matrix JSON + CSV")
+                    .clicked()
+                {
+                    self.export_classifier_diagnostic();
+                }
                 if ui.button("Import .sonoworkset.json...").clicked() {
                     if let Some(path) = rfd::FileDialog::new()
                         .add_filter("SonoWing Workset", &["json"])
@@ -4730,7 +5032,7 @@ impl SonoWingApp {
             .open(&mut open)
             .default_width(780.0)
             .show(ctx, |ui| {
-                ui.label("Shortcuts: Space = Play/Pause | Left/Right = Step Calls | 0 / Z = Reset Zoom | 1-3 = Audition Mode (TE10x/TE20x/Het) | Shift+Drag = Caliper | Esc = Close/Clear | F1 = Key | F5/F9 = Save/Load SQLite");
+                ui.label("Shortcuts: Space = Play/Pause | Left/Right = Step Calls | 0 / Z = Reset Zoom | 1-3 = Audition Mode (TE10x/TE20x/Het) | Shift+Drag = Caliper | Ctrl+K = Command Palette | Esc = Close/Clear | F1 = Key | F5/F9 = Save/Load SQLite");
                 ui.separator();
                 egui::ScrollArea::vertical().max_height(420.0).show(ui, |ui| {
                     egui::Grid::new("ref_species_modal_grid")
@@ -5118,6 +5420,188 @@ mod tests {
             let _ = pal.map_unit(1.0);
         }
 
+        let _ = std::fs::remove_file(&tmp_db);
+    }
+
+    #[test]
+    fn ctrl_k_command_palette_opens_filters_executes_and_escapes() {
+        let tmp_db = std::env::temp_dir().join(format!(
+            "sonowing_palette_nav_test_{}.sqlite3",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp_db);
+        let ctx = egui::Context::default();
+        let mut app = SonoWingApp::new_headless(&ctx, None, true, tmp_db.clone());
+
+        let ctrl_k = egui::Event::Key {
+            key: egui::Key::K,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::CTRL,
+        };
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1480.0, 920.0),
+                )),
+                modifiers: egui::Modifiers::CTRL,
+                events: vec![ctrl_k],
+                ..Default::default()
+            },
+            |c| app.ui_step(c),
+        );
+        assert!(app.show_command_palette);
+
+        app.command_palette_query = "B4".to_string();
+        let filtered = app.filtered_palette_commands();
+        assert!(!filtered.is_empty());
+        assert!(filtered[0].0.contains("B4"));
+
+        let enter = egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1480.0, 920.0),
+                )),
+                events: vec![enter],
+                ..Default::default()
+            },
+            |c| app.ui_step(c),
+        );
+        assert!(!app.show_command_palette);
+        assert_eq!(app.current_preset, Some(BuiltinPreset::B4RhfeHorseshoeCf));
+
+        // Re-open and press Esc to dismiss
+        let ctrl_k2 = egui::Event::Key {
+            key: egui::Key::K,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::CTRL,
+        };
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1480.0, 920.0),
+                )),
+                modifiers: egui::Modifiers::CTRL,
+                events: vec![ctrl_k2],
+                ..Default::default()
+            },
+            |c| app.ui_step(c),
+        );
+        assert!(app.show_command_palette);
+        let esc = egui::Event::Key {
+            key: egui::Key::Escape,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        };
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1480.0, 920.0),
+                )),
+                events: vec![esc],
+                ..Default::default()
+            },
+            |c| app.ui_step(c),
+        );
+        assert!(!app.show_command_palette);
+
+        let _ = std::fs::remove_file(&tmp_db);
+    }
+
+    #[test]
+    fn ctrl_k_respects_wants_keyboard_input_guard() {
+        let tmp_db = std::env::temp_dir().join(format!(
+            "sonowing_palette_guard_test_{}.sqlite3",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp_db);
+        let ctx = egui::Context::default();
+        let mut app = SonoWingApp::new_headless(&ctx, None, true, tmp_db.clone());
+        let text_id = egui::Id::new("sonowing_guard_text_input");
+        let mut buf = String::new();
+        let _ = ctx.run(egui::RawInput::default(), |c| {
+            egui::CentralPanel::default().show(c, |ui| {
+                ui.add(egui::TextEdit::singleline(&mut buf).id(text_id)).request_focus();
+            });
+        });
+        assert!(ctx.wants_keyboard_input());
+        let ctrl_k = egui::Event::Key {
+            key: egui::Key::K,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::CTRL,
+        };
+        let _ = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1480.0, 920.0),
+                )),
+                modifiers: egui::Modifiers::CTRL,
+                events: vec![ctrl_k],
+                ..Default::default()
+            },
+            |c| {
+                egui::CentralPanel::default().show(c, |ui| {
+                    ui.add(egui::TextEdit::singleline(&mut buf).id(text_id));
+                });
+                app.ui_step(c);
+            },
+        );
+        assert!(!app.show_command_palette);
+        let _ = std::fs::remove_file(&tmp_db);
+    }
+
+    #[test]
+    fn palette_actions_switch_fft_modes_filters_and_export_classifier_diagnostic() {
+        let tmp_db = std::env::temp_dir().join(format!(
+            "sonowing_palette_actions_test_{}.sqlite3",
+            std::process::id()
+        ));
+        let export_dir = std::env::temp_dir().join(format!(
+            "sonowing_palette_diag_out_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&tmp_db);
+        let _ = std::fs::remove_dir_all(&export_dir);
+
+        let ctx = egui::Context::default();
+        let mut app = SonoWingApp::new_headless(&ctx, None, true, tmp_db.clone());
+        app.export_dir_input = export_dir.display().to_string();
+
+        app.execute_palette_action(SonoPaletteAction::StftBatCf);
+        assert_eq!(app.stft_cfg.fft_size, 2048);
+        assert_eq!(app.stft_cfg.hop_size, 128);
+
+        app.execute_palette_action(SonoPaletteAction::ToggleBandpass);
+        assert!(app.apply_bandpass);
+
+        app.execute_palette_action(SonoPaletteAction::SetPalette(ColormapPalette::ViridisField));
+        assert_eq!(app.palette, ColormapPalette::ViridisField);
+
+        app.execute_palette_action(SonoPaletteAction::ExportClassifierDiagnostic);
+        assert!(app.last_classifier_diag.is_some());
+        assert!(export_dir.join("sonowing_classifier_diagnostic.json").exists());
+        assert!(export_dir.join("sonowing_classifier_diagnostic.csv").exists());
+
+        let _ = std::fs::remove_dir_all(&export_dir);
         let _ = std::fs::remove_file(&tmp_db);
     }
 }

@@ -25,7 +25,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use rayon::prelude::*;
 use sonowing::call_extractor::{extract_calls, DetectionMode, DetectorConfig, TaxonDomain};
 use sonowing::dsp::{compute_stft, StftConfig};
-use sonowing::exporters::{csv_escape, write_calls_csv, write_raven_selection_table};
+use sonowing::exporters::{
+    csv_escape, export_classifier_diagnostic_files, write_calls_csv, write_raven_selection_table,
+};
 use sonowing::gui::{load_any_bioacoustic_path, render_headless_screenshot, SonoWingApp};
 use sonowing::harmonic_tracker::analyze_harmonic_stacks;
 use sonowing::live_mic::LiveMicEngine;
@@ -145,6 +147,16 @@ enum Commands {
         /// Output .wav path.
         #[arg(long, short)]
         output: PathBuf,
+    },
+
+    /// Run batch call-classifier SNR sweep & confusion-matrix diagnostic summary (JSON + CSV) across all 9 presets.
+    ClassifierDiag {
+        /// Comma-separated SNR trigger thresholds in dB.
+        #[arg(long, default_value = "8.0,12.0,16.0,20.0")]
+        snr_list: String,
+        /// Output directory for sonowing_classifier_diagnostic.json and .csv.
+        #[arg(long, default_value = "exports")]
+        out_dir: PathBuf,
     },
 }
 
@@ -339,6 +351,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 rec.sample_rate_hz,
                 rec.duration_s(),
                 output.display()
+            );
+            Ok(())
+        }
+        Some(Commands::ClassifierDiag { snr_list, out_dir }) => {
+            let snrs: Vec<f32> = snr_list
+                .split(',')
+                .filter_map(|s| s.trim().parse::<f32>().ok())
+                .collect();
+            let (jp, cp, rep) = export_classifier_diagnostic_files(&out_dir, &snrs)?;
+            println!(
+                "[SonoWing Diagnostic] Evaluated {} presets x {} SNR thresholds ({} calls, {:.1}% overall precision) -> {} & {}",
+                rep.preset_count,
+                rep.snr_thresholds_db.len(),
+                rep.total_calls_evaluated,
+                rep.overall_precision * 100.0,
+                jp.display(),
+                cp.display()
             );
             Ok(())
         }
@@ -635,5 +664,26 @@ mod tests {
         assert_eq!(&ico_bytes[0..4], &[0x00, 0x00, 0x01, 0x00]);
         let count = u16::from_le_bytes([ico_bytes[4], ico_bytes[5]]);
         assert!(count >= 4, "Expected >= 4 ICO sizes, got {count}");
+    }
+
+    #[test]
+    fn cli_parses_classifier_diag_subcommand() {
+        use clap::Parser;
+        let parsed = super::Cli::try_parse_from([
+            "sonowing",
+            "classifier-diag",
+            "--snr-list",
+            "10.0,15.0",
+            "--out-dir",
+            "diag_out",
+        ])
+        .expect("clap parses classifier-diag");
+        match parsed.command {
+            Some(super::Commands::ClassifierDiag { snr_list, out_dir }) => {
+                assert_eq!(snr_list, "10.0,15.0");
+                assert_eq!(out_dir, std::path::PathBuf::from("diag_out"));
+            }
+            other => panic!("Expected ClassifierDiag, got {:?}", other),
+        }
     }
 }
