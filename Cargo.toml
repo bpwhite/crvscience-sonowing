@@ -5,6 +5,9 @@ edition = "2021"
 authors = ["Bryan P. White <CRV Science>"]
 description = "Native safe-Rust bat echolocation and avian vocalization sonic/ultrasonic waveform, STFT spectrogram, MFCC/UMAP clustering, harmonic stack, live mic, and soundscape analyzer"
 license = "GPL-3.0-or-later"
+homepage = "https://crvscience.com/apps"
+repository = "https://github.com/bpwhite/crvscience-sonowing"
+readme = "README.md"
 
 [lib]
 name = "sonowing"
